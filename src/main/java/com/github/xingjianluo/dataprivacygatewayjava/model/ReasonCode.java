@@ -1,0 +1,27 @@
+package com.github.xingjianluo.dataprivacygatewayjava.model;
+
+/**
+ * 可区分的结论 / 拒绝原因码。每种失败原因都有独立码，
+ * 便于审计复现与调用方区分处理。
+ */
+public enum ReasonCode {
+    INGEST_OK,
+    ALLOWED,
+    MASKED_INSUFFICIENT_CLEARANCE,
+    DENIED_UNAUTHORIZED_RAW_READ,
+    REJECT_MISSING_FIELD,
+    REJECT_TYPE_MISMATCH,
+    REJECT_SIZE_EXCEEDED,
+    REJECT_DEPTH_EXCEEDED,
+    REJECT_ARRAY_TOO_LARGE,
+    REJECT_STRING_TOO_LONG,
+    REQUEST_TIMEOUT,
+    KEY_VERSION_MISSING,
+    KEY_VERSION_MISMATCH,
+    CRYPTO_FAILURE,
+    POLICY_VERSION_NOT_FOUND,
+    TRUNCATED_BY_LIMIT,
+    AUDIT_WRITE_FAILED,
+    MALFORMED_ENVELOPE,
+    BAD_REQUEST
+}
