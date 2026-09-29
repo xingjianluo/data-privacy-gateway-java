@@ -11,8 +11,8 @@ model/      统一领域模型：分级、原因码、策略快照、密钥版�
 error/      GatewayException（只携带 ReasonCode + 受控消息）
 config/     GatewayProperties（规模/耗时/留存可配置）、@EnableScheduling
 crypto/     CryptoService + AesGcmCryptoService（AES-GCM-256，版本化）
-store/      PolicyStore / KeyStore / RecordStore / AuditStore（内存、线程安全、版本化）
-service/    IngestService / DecisionService / MaskingService /
+store/      PolicyStore / KeyStore / RecordStore / AuditStore / GrantStore（内存、线程安全、版本化）
+service/    IngestService / DecisionService / MaskingService / GrantService /
             LimitGuard / AuditService / PrivacyGateway（门面对外统一入口）
 bootstrap/  SeedDataInitializer（播种密钥 v1、策略 v1）
 web/        REST 控制器 + GlobalExceptionHandler（统一受控错误响应）
@@ -92,7 +92,53 @@ REJECT 模式超限直接拒绝；TRUNCATE 模式仅对过深子树与超长数�
 `TRUNCATED_BY_LIMIT`；字符串与整体字节规模在任何模式下都拒绝。处理全程在深拷贝副本上
 进行，失败时不写半成品、不泄漏解密中间结果。
 
-## 8. REST 速览
+## 8. 批量访问与限时明文导出
+
+### 批量访问 `batchAccess`
+
+- 一次请求携带多条 `BatchItem{recordId, fields}`；`fields` 为空表示全部字段，
+  点名时只返回命中的顶层逻辑字段（别名归一后命中也算）。
+- 逐条返回 `BatchItemResult{outcome, view, decisions, policyVersion, keyVersion, auditEventId}`：
+  允许 / 脱敏 / 拒绝 / 失败混在同一批里逐条可区分；**某一条被拒绝或失败不影响其他条目**，
+  被拒绝的条目不携带任何字段视图（与单条入口相同的失败安全）。
+- 每条结果都带判定依据：有规则字段由递归处理产出 `FieldDecision`，
+  无规则字段在批量路径显式补一条 `ALLOW(PUBLIC)` 依据；每条都钉在批次开始时的
+  `(policyVersion, keyVersion)` 上。
+- 密文信封按「该字段的标量值」参与字段级判定（脱敏对信封幂等不变形），
+  不会因信封是对象而绕过规则。
+
+### 限时明文导出 `batchExport`
+
+- 导出必须先签发限时授权 `ExportGrant{grantId, caller, recordIds, fields, expiresAt}`：
+  绑定具体调用方、记录范围、字段范围与明确有效期；撤销即原子移除，过期自动失效
+  （校验时判定 + 定时清理）。
+- 校验失败原因码彼此可区分并全部留审计：
+  `GRANT_NOT_FOUND`（不存在/已撤销）、`GRANT_EXPIRED`（已过期）、
+  `GRANT_CALLER_MISMATCH`（跨调用方使用）、`GRANT_SCOPE_VIOLATION`（记录/字段越范围，
+  越范围按条目拒绝，不拖垮整批）。
+- **授权只收紧不放宽**：导出条目按与单条入口相同的 `raw` 口径做字段级判定，
+  同一字段同一持证等级在两个入口结论一致；授权范围内判定为 ALLOW 的密文信封
+  按信封版本解密（轮换后历史密文仍可解开），明文只存在于返回视图，不落库。
+- 条目未点名字段时，导出范围自动收敛为授权字段范围（空选择 ≠ 全表导出）。
+
+### 批量规模 / 耗时 / 并发
+
+- `privacy-gateway.batch.max-items` 配置单批条数；超限按 `limits.mode` 既定约定：
+  REJECT → 整批拒绝 `BATCH_LIMIT_EXCEEDED`（留审计）；TRUNCATE → 截断到上限并
+  在响应标记 `truncated=true` 与 `requestedCount`。
+- 处理时限复用 `limits.max-elapsed-millis`：超时 `REQUEST_TIMEOUT` **整批失败**，
+  已处理/已解开的中间视图随异常丢弃，不留部分结果；读取无副作用，重试天然幂等，
+  审计事件用随机 UUID，不存在重复计数。
+- 批次开始时一次性固定「策略快照 + 密钥版本 + 授权快照」：并发撤销授权时，
+  每批要么完整执行要么干净拒绝；策略/密钥并发更新不影响本批结论，无半新半旧。
+
+### 与既有单条能力的兼容范围
+
+单条入口（`access` / `decryptRecord` / `encryptFields`）行为完全不变；批量路径复用同一套
+`DecisionService` / `MaskingService` / `CryptoService` 与同一递归处理器，仅新增：
+批量编排、授权校验、无规则字段的显式 ALLOW 依据（仅批量路径）。
+
+## 9. REST 速览
 
 ```
 POST /api/gateway/records                 接入（body: recordId, source, data, schema?）
@@ -101,14 +147,18 @@ POST /api/gateway/policy/versions         发布新策略（完整规则数组�
 POST /api/gateway/keys/rotate             密钥轮换
 POST /api/gateway/records/{id}/encrypt    按逻辑字段名加密（body: {"fields":["phone"]}）
 POST /api/gateway/records/{id}/decrypt?caller=ops        解密（明文不落库）
+POST /api/gateway/batch/access            批量访问（body: caller, clearance, raw, items[]）
+POST /api/gateway/grants                  签发限时导出授权（caller, recordIds, fields, ttlMillis?）
+DELETE /api/gateway/grants/{id}           撤销授权
+POST /api/gateway/batch/export?grantId=   批量明文导出（需有效授权）
 ```
 
 错误响应统一为 `{"ok":false,"reason":"<ReasonCode>","message":"<受控消息>"}`。
 
-## 9. 验证方法
+## 10. 验证方法
 
 ```bash
-mvn -o test                 # 离线全量测试（27 个用例）
+mvn -o test                 # 离线全量测试（42 个用例）
 mvn -o test -Dtest=KeyRotationTest       # 只跑密钥轮换
 mvn -o test -Dtest=ConcurrencyUpdateTest # 只跑并发更新
 mvn spring-boot:run         # 启动服务（播种密钥 v1、策略 v1）
@@ -125,6 +175,10 @@ mvn spring-boot:run         # 启动服务（播种密钥 v1、策略 v1）
 - `ConcurrencyUpdateTest`：策略/密钥并发发布版本唯一单调、历史可读、读写版本自洽
 - `AuditRetentionTest`：四类结论留痕、审计失败不影响主结论、TTL 整条清除
 - `LimitGuardTest`：REJECT/TRUNCATE、深度/数组/耗时超限、拒绝无半成品
+- `BatchAccessTest`：批量中允许/脱敏/拒绝混合、点名字段、单批条数超限（拒绝/截断）、
+  超时整批失败无部分结果
+- `ExportGrantTest`：限时授权签发/越范围/过期/跨调用方/撤销、字段级口径与单条入口一致、
+  密钥轮换后批量解密历史密文、并发撤销下每批完整成功或干净拒绝
 
 ### curl 示例
 
@@ -136,4 +190,18 @@ curl -s -XPOST localhost:8080/api/gateway/records -H 'Content-Type: application/
 curl -s 'localhost:8080/api/gateway/records/u1?caller=guest&clearance=PUBLIC'
 curl -s 'localhost:8080/api/gateway/records/u1?caller=guest&clearance=PUBLIC&raw=true'
 curl -s -XPOST localhost:8080/api/gateway/keys/rotate
+
+# 批量访问：一次拿多条记录、每条点名字段
+curl -s -XPOST localhost:8080/api/gateway/batch/access -H 'Content-Type: application/json' -d '{
+  "caller":"guest","clearance":"PUBLIC","raw":false,
+  "items":[{"recordId":"u1","fields":["name","phone"]}]}'
+
+# 签发限时授权并批量明文导出
+GRANT=$(curl -s -XPOST localhost:8080/api/gateway/grants -H 'Content-Type: application/json' -d '{
+  "caller":"ops","recordIds":["u1"],"fields":["name","phone"],"ttlMillis":300000}' | jq -r .grantId)
+curl -s -XPOST "localhost:8080/api/gateway/batch/export?grantId=$GRANT" \
+  -H 'Content-Type: application/json' -d '{
+  "caller":"ops","clearance":"RESTRICTED",
+  "items":[{"recordId":"u1","fields":["name","phone"]}]}'
+curl -s -XDELETE localhost:8080/api/gateway/grants/$GRANT
 ```

@@ -57,6 +57,72 @@ public class GatewayController {
         return gateway.access(new AccessRequest(caller, clearance, id, raw));
     }
 
+    /** 批量访问：body={"caller":...,"clearance":...,"raw":false,"items":[{"recordId":...,"fields":[...]}]}。 */
+    @PostMapping("/batch/access")
+    public com.github.xingjianluo.dataprivacygatewayjava.model.BatchResponse batchAccess(
+            @RequestBody Map<String, Object> body) {
+        return gateway.batchAccess(parseBatchRequest(body));
+    }
+
+    /** 批量明文导出：需要限时授权 grantId。 */
+    @PostMapping("/batch/export")
+    public com.github.xingjianluo.dataprivacygatewayjava.model.BatchResponse batchExport(
+            @RequestParam String grantId,
+            @RequestBody Map<String, Object> body) {
+        return gateway.batchExport(grantId, parseBatchRequest(body));
+    }
+
+    /** 签发限时导出授权：body={"caller":...,"recordIds":[...],"fields":[...],"ttlMillis":...}。 */
+    @PostMapping("/grants")
+    public Map<String, Object> issueGrant(@RequestBody Map<String, Object> body) {
+        var grant = gateway.issueGrant(
+                str(body.get("caller")),
+                new java.util.HashSet<>(strList(body.get("recordIds"))),
+                new java.util.HashSet<>(strList(body.get("fields"))),
+                body.get("ttlMillis") instanceof Number n ? n.longValue() : -1L);
+        return Map.of("grantId", grant.grantId(), "caller", grant.caller(),
+                "expiresAt", grant.expiresAt());
+    }
+
+    /** 撤销授权。 */
+    @DeleteMapping("/grants/{id}")
+    public Map<String, Object> revokeGrant(@PathVariable String id) {
+        return Map.of("grantId", id, "revoked", gateway.revokeGrant(id));
+    }
+
+    private static com.github.xingjianluo.dataprivacygatewayjava.model.BatchAccessRequest parseBatchRequest(
+            Map<String, Object> body) {
+        String caller = str(body.get("caller"));
+        Level clearance = Level.valueOf(strOr(body.get("clearance"), "PUBLIC"));
+        boolean raw = Boolean.TRUE.equals(body.get("raw"));
+        List<com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem> items = new ArrayList<>();
+        Object itemsObj = body.get("items");
+        if (itemsObj instanceof List<?> list) {
+            for (Object item : list) {
+                if (item instanceof Map<?, ?> im) {
+                    items.add(new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem(
+                            str(im.get("recordId")), strList(im.get("fields"))));
+                }
+            }
+        }
+        return new com.github.xingjianluo.dataprivacygatewayjava.model.BatchAccessRequest(
+                caller, clearance, raw, items);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> strList(Object o) {
+        if (!(o instanceof List<?> list)) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (Object e : list) {
+            if (e != null) {
+                out.add(String.valueOf(e));
+            }
+        }
+        return out;
+    }
+
     /** 发布新策略版本，返回新版本号。 */
     @PostMapping("/policy/versions")
     public Map<String, Object> publishPolicy(@RequestBody List<Map<String, Object>> rulesBody) {

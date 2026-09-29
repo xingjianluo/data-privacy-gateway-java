@@ -20,6 +20,8 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Map<String, Object>> handleGateway(GatewayException ex) {
         HttpStatus status = switch (ex.code()) {
             case DENIED_UNAUTHORIZED_RAW_READ -> HttpStatus.FORBIDDEN;
+            case GRANT_EXPIRED, GRANT_CALLER_MISMATCH, GRANT_SCOPE_VIOLATION -> HttpStatus.FORBIDDEN;
+            case GRANT_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case BAD_REQUEST, MALFORMED_ENVELOPE -> HttpStatus.BAD_REQUEST;
             case KEY_VERSION_MISSING, POLICY_VERSION_NOT_FOUND -> HttpStatus.CONFLICT;
             case REQUEST_TIMEOUT -> HttpStatus.REQUEST_TIMEOUT;

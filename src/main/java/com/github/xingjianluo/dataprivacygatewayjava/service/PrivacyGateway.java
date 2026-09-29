@@ -5,6 +5,8 @@ import com.github.xingjianluo.dataprivacygatewayjava.crypto.CryptoService;
 import com.github.xingjianluo.dataprivacygatewayjava.error.GatewayException;
 import com.github.xingjianluo.dataprivacygatewayjava.model.AccessRequest;
 import com.github.xingjianluo.dataprivacygatewayjava.model.AccessResponse;
+import com.github.xingjianluo.dataprivacygatewayjava.model.BatchAccessRequest;
+import com.github.xingjianluo.dataprivacygatewayjava.model.BatchResponse;
 import com.github.xingjianluo.dataprivacygatewayjava.model.CipherEnvelope;
 import com.github.xingjianluo.dataprivacygatewayjava.model.FieldAction;
 import com.github.xingjianluo.dataprivacygatewayjava.model.FieldDecision;
@@ -51,11 +53,15 @@ public class PrivacyGateway {
     private final MaskingService maskingService;
     private final AuditService auditService;
     private final LimitGuard limitGuard;
+    private final GrantService grantService;
+    private final com.github.xingjianluo.dataprivacygatewayjava.config.GatewayProperties batchProps;
 
     public PrivacyGateway(PolicyStore policyStore, KeyStore keyStore, RecordStore recordStore,
                           CryptoService cryptoService, IngestService ingestService,
                           DecisionService decisionService, MaskingService maskingService,
-                          AuditService auditService, LimitGuard limitGuard) {
+                          AuditService auditService, LimitGuard limitGuard,
+                          GrantService grantService,
+                          com.github.xingjianluo.dataprivacygatewayjava.config.GatewayProperties properties) {
         this.policyStore = policyStore;
         this.keyStore = keyStore;
         this.recordStore = recordStore;
@@ -65,6 +71,8 @@ public class PrivacyGateway {
         this.maskingService = maskingService;
         this.auditService = auditService;
         this.limitGuard = limitGuard;
+        this.grantService = grantService;
+        this.batchProps = properties;
     }
 
     public IngestReport ingest(String source, String recordId, Map<String, Object> raw, RecordSchema schema) {
@@ -302,6 +310,243 @@ public class PrivacyGateway {
     }
 
     /**
+     * 批量访问：一次请求多条记录，逐条给出结论；单条被拒绝/失败不影响其他条目。
+     * 批次开始时固定策略快照与密钥版本，整批对应同一确定版本；
+     * 超时整批失败且不返回任何部分结果（中间视图全部丢弃）。
+     */
+    public BatchResponse batchAccess(BatchAccessRequest request) {
+        return doBatch(request, null, "BATCH_ACCESS", false);
+    }
+
+    /**
+     * 批量明文导出：在批量访问之上叠加限时授权校验（调用方 / 记录范围 / 字段范围 / 有效期）。
+     * 授权只收紧不放宽：字段级判定沿用与单条入口相同的 raw 口径，
+     * 授权范围内判定为 ALLOW 的密文信封按信封版本解密（轮换后历史密文仍可解开）。
+     * 明文只存在于返回视图中，不落库；中途失败/超时整批丢弃，不留已解开的中间结果。
+     */
+    public BatchResponse batchExport(String grantId, BatchAccessRequest request) {
+        String caller = request == null ? null : request.caller();
+        com.github.xingjianluo.dataprivacygatewayjava.model.ExportGrant grant;
+        try {
+            // 授权快照在校验时确定：并发撤销要么发生在校验前（本批失败）、要么之后（本批完整执行）
+            grant = grantService.requireValid(grantId, caller);
+        } catch (GatewayException e) {
+            Policy p = policyStore.current();
+            auditService.record(caller, "BATCH_EXPORT", "grant:" + grantId, e.code(),
+                    p == null ? null : p.version(), keyStore.currentVersion(), null,
+                    "导出授权校验失败：" + e.getMessage(), Map.of("grantId", String.valueOf(grantId)));
+            throw e;
+        }
+        // 导出口径：raw 语义；条目未点名字段时收敛为授权字段范围（空=全部仅限授权范围内）
+        List<com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem> items = new ArrayList<>();
+        for (com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item : request.items()) {
+            items.add(item.fields().isEmpty()
+                    ? new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem(
+                            item.recordId(), List.copyOf(grant.fields()))
+                    : item);
+        }
+        BatchAccessRequest exportRequest = new BatchAccessRequest(
+                request.caller(), request.clearance(), true, items);
+        return doBatch(exportRequest, grant, "BATCH_EXPORT", true);
+    }
+
+    /**
+     * 批量处理主流程。grant 非空时按导出口径逐条做范围校验（由 batchExport 传入）。
+     */
+    private BatchResponse doBatch(BatchAccessRequest request,
+                                  com.github.xingjianluo.dataprivacygatewayjava.model.ExportGrant grant,
+                                  String operation, boolean decrypt) {
+        long start = System.nanoTime();
+        if (request == null || request.caller() == null || request.caller().isBlank()) {
+            throw new GatewayException(ReasonCode.BAD_REQUEST, "批量请求缺少调用方");
+        }
+        Policy policy = policyStore.current();
+        if (policy == null) {
+            throw new GatewayException(ReasonCode.POLICY_VERSION_NOT_FOUND, "当前无可用策略版本");
+        }
+        // 固定本批次的策略快照与密钥版本：处理期间任何更新/轮换都不影响本批结论
+        int pinnedKeyVersion = keyStore.currentVersion();
+
+        List<com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem> items = request.items();
+        int requestedCount = items.size();
+        boolean batchTruncated = false;
+        int maxItems = batchMaxItems();
+        if (requestedCount > maxItems) {
+            if (limitGuard.mode() == com.github.xingjianluo.dataprivacygatewayjava.model.LimitMode.REJECT) {
+                auditService.record(request.caller(), operation, "batch:" + requestedCount,
+                        ReasonCode.BATCH_LIMIT_EXCEEDED, policy.version(), pinnedKeyVersion, null,
+                        "单批条数 " + requestedCount + " 超过上限 " + maxItems + "，按 REJECT 约定整批拒绝",
+                        Map.of("maxItems", String.valueOf(maxItems)));
+                throw new GatewayException(ReasonCode.BATCH_LIMIT_EXCEEDED,
+                        "单批条数 " + requestedCount + " 超过上限 " + maxItems);
+            }
+            // TRUNCATE 约定：截断到上限并在响应中明确标记
+            items = new ArrayList<>(items.subList(0, maxItems));
+            batchTruncated = true;
+        }
+
+        List<com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult> results = new ArrayList<>();
+        for (com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item : items) {
+            // 超时：整批失败，已处理的中间视图随异常一并丢弃，不留部分结果
+            limitGuard.checkElapsed(start, ReasonCode.ALLOWED);
+            results.add(processBatchItem(request, item, grant, policy, pinnedKeyVersion,
+                    operation, decrypt, start));
+        }
+        return new BatchResponse(results, requestedCount, batchTruncated,
+                policy.version(), pinnedKeyVersion);
+    }
+
+    /** 处理批量中的单条：任何失败都收敛为该条目的结论，绝不影响其他条目。 */
+    private com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult processBatchItem(
+            BatchAccessRequest request,
+            com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item,
+            com.github.xingjianluo.dataprivacygatewayjava.model.ExportGrant grant,
+            Policy policy, int pinnedKeyVersion, String operation, boolean decrypt,
+            long startNanos) {
+        String recordId = item.recordId();
+        try {
+            if (recordId == null || recordId.isBlank()) {
+                throw new GatewayException(ReasonCode.BAD_REQUEST, "条目缺少 recordId");
+            }
+            // 导出口径：授权范围逐条校验（记录范围 + 字段范围）
+            if (grant != null) {
+                checkGrantScope(grant, item);
+            }
+            NormalizedRecord record = recordStore.get(recordId);
+            if (record == null) {
+                throw new GatewayException(ReasonCode.BAD_REQUEST, "记录不存在：" + recordId);
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> view = (Map<String, Object>) JsonCodec.deepCopy(record.data());
+            // 条目点名了字段：只保留命中的顶层逻辑字段（含别名归一）
+            if (!item.fields().isEmpty()) {
+                view = selectFields(view, item.fields(), policy);
+            }
+            AccessRequest single = new AccessRequest(request.caller(), request.clearance(),
+                    recordId, request.rawRequested());
+            List<FieldDecision> decisions = new ArrayList<>();
+            boolean[] truncated = {false};
+            process(view, "$", 1, null, single, policy, decisions, truncated, startNanos);
+            addImplicitAllowDecisions(view, item, request, policy, decisions);
+
+            boolean denied = decisions.stream().anyMatch(d -> d.action() == FieldAction.DENY);
+            ReasonCode outcome;
+            if (denied) {
+                outcome = ReasonCode.DENIED_UNAUTHORIZED_RAW_READ;
+            } else if (truncated[0]) {
+                outcome = ReasonCode.TRUNCATED_BY_LIMIT;
+            } else if (decisions.stream().anyMatch(d -> d.action() == FieldAction.MASK)) {
+                outcome = ReasonCode.MASKED_INSUFFICIENT_CLEARANCE;
+            } else {
+                outcome = ReasonCode.ALLOWED;
+            }
+            String eventId = auditService.record(request.caller(), operation, recordId, outcome,
+                    policy.version(), pinnedKeyVersion, safeDigest(record.data()),
+                    summarize(decisions), Map.of("batchItem", "true"));
+            // 与单条入口一致的失败安全：越权取原文的条目不返回任何字段视图
+            Map<String, Object> resultView = denied ? null : view;
+            if (resultView != null && decrypt) {
+                // 明文导出：解开视图中的密文信封（按信封版本取历史密钥，轮换后仍可解）。
+                // 解密失败抛 GatewayException，由外层 catch 收敛为该条目失败，不影响其他条目。
+                decryptRecursively(resultView, startNanos);
+            }
+            return new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult(
+                    recordId, outcome, resultView, decisions, policy.version(), pinnedKeyVersion,
+                    eventId, truncated[0], denied ? "越权读取原始值被拒绝" : null);
+        } catch (GatewayException e) {
+            if (e.code() == ReasonCode.REQUEST_TIMEOUT) {
+                // 超时是批次级结论：整批失败，已处理/已解开的中间视图随异常一并丢弃
+                throw e;
+            }
+            String eventId = auditService.record(request.caller(), operation,
+                    String.valueOf(recordId), e.code(), policy.version(), pinnedKeyVersion, null,
+                    "条目处理失败：" + e.getMessage(), Map.of("batchItem", "true"));
+            return new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult(
+                    String.valueOf(recordId), e.code(), null, List.of(), policy.version(),
+                    pinnedKeyVersion, eventId, false, e.getMessage());
+        }
+    }
+
+    /**
+     * 批量路径补充：无规则字段按 PUBLIC 显式补一条 ALLOW 判定依据，
+     * 让每条结果都能给出完整依据（单条入口行为保持不变）。
+     */
+    private void addImplicitAllowDecisions(Map<String, Object> view,
+                                           com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item,
+                                           BatchAccessRequest request, Policy policy,
+                                           List<FieldDecision> decisions) {
+        List<String> candidates = item.fields().isEmpty()
+                ? List.copyOf(view.keySet())
+                : item.fields();
+        for (String f : candidates) {
+            if (decisionService.findRule(policy, f) != null) {
+                continue; // 有规则的字段已由递归处理给出判定
+            }
+            boolean already = decisions.stream().anyMatch(d -> f.equals(d.field()));
+            if (!already) {
+                decisions.add(new FieldDecision("$." + f, f, FieldAction.ALLOW, ReasonCode.ALLOWED,
+                        request.clearance(), Level.PUBLIC, policy.version()));
+            }
+        }
+    }
+
+    /** 导出授权范围校验：记录与字段都必须在授权范围内。 */
+    private static void checkGrantScope(
+            com.github.xingjianluo.dataprivacygatewayjava.model.ExportGrant grant,
+            com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item) {
+        if (!grant.recordIds().contains(item.recordId())) {
+            throw new GatewayException(ReasonCode.GRANT_SCOPE_VIOLATION,
+                    "记录 " + item.recordId() + " 不在授权范围");
+        }
+        for (String f : item.fields()) {
+            if (!grant.fields().contains(f)) {
+                throw new GatewayException(ReasonCode.GRANT_SCOPE_VIOLATION,
+                        "字段 " + f + " 不在授权范围");
+            }
+        }
+    }
+
+    /** 按点名的逻辑字段筛选顶层键：字段本名、规则字段名或别名命中即保留。 */
+    private Map<String, Object> selectFields(Map<String, Object> view, List<String> wanted,
+                                             Policy policy) {
+        Map<String, Object> selected = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : view.entrySet()) {
+            String key = e.getKey();
+            if (wanted.contains(key)) {
+                selected.put(key, e.getValue());
+                continue;
+            }
+            FieldRule rule = decisionService.findRule(policy, key);
+            if (rule != null && wanted.contains(rule.field())) {
+                selected.put(key, e.getValue());
+            }
+        }
+        return selected;
+    }
+
+    private int batchMaxItems() {
+        return batchProperties().getMaxItems();
+    }
+
+    private com.github.xingjianluo.dataprivacygatewayjava.config.GatewayProperties.Batch batchProperties() {
+        return batchProps.getBatch();
+    }
+
+    /**
+     * 递归处理 JSON 结构。
+
+    /** 签发限时明文导出授权。 */
+    public com.github.xingjianluo.dataprivacygatewayjava.model.ExportGrant issueGrant(
+            String caller, java.util.Set<String> recordIds, java.util.Set<String> fields, long ttlMillis) {
+        return grantService.issue(caller, recordIds, fields, ttlMillis);
+    }
+
+    /** 撤销限时授权。 */
+    public boolean revokeGrant(String grantId) {
+        return grantService.revoke(grantId);
+    }
+
+    /**
      * 递归处理 JSON 结构。
      * 键名归一：逻辑名、别名、{@code {"value": x}} / {@code {"type":t,"value":x}} 包装
      * 全部视作同一逻辑字段；对象与数组任意深度一致。
@@ -340,7 +585,10 @@ public class PrivacyGateway {
             for (Map.Entry<String, Object> e : new ArrayList<>(map.entrySet())) {
                 String key = e.getKey();
                 Object child = e.getValue();
-                if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                if (AesGcmCryptoService.isEnvelope(child)) {
+                    // 密文信封视为该字段的标量值：字段规则照常判定（脱敏对信封幂等不变形）
+                    applyScalar(map, key, key, path + "." + key, child, request, policy, decisions);
+                } else if (child instanceof Map<?, ?> || child instanceof List<?>) {
                     process(child, path + "." + key, depth + 1, key,
                             request, policy, decisions, truncated, startNanos);
                 } else {
@@ -367,7 +615,11 @@ public class PrivacyGateway {
                 if (child instanceof Map<?, ?> cm && !isWrapperMap(cm)) {
                     childWrapper = null;
                 }
-                if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                if (AesGcmCryptoService.isEnvelope(child)) {
+                    // 数组中的密文信封：按继承逻辑名对标量判定
+                    applyScalar(arr, i, wrapperField, path + "[" + i + "]", child,
+                            request, policy, decisions);
+                } else if (child instanceof Map<?, ?> || child instanceof List<?>) {
                     process(child, path + "[" + i + "]", depth + 1, childWrapper,
                             request, policy, decisions, truncated, startNanos);
                 } else {
