@@ -15,6 +15,7 @@ import com.github.xingjianluo.dataprivacygatewayjava.model.NormalizedRecord;
 import com.github.xingjianluo.dataprivacygatewayjava.model.Policy;
 import com.github.xingjianluo.dataprivacygatewayjava.model.ReasonCode;
 import com.github.xingjianluo.dataprivacygatewayjava.model.RecordSchema;
+import com.github.xingjianluo.dataprivacygatewayjava.model.ResolvedGrant;
 import com.github.xingjianluo.dataprivacygatewayjava.store.KeyStore;
 import com.github.xingjianluo.dataprivacygatewayjava.store.PolicyStore;
 import com.github.xingjianluo.dataprivacygatewayjava.store.RecordStore;
@@ -51,11 +52,12 @@ public class PrivacyGateway {
     private final MaskingService maskingService;
     private final AuditService auditService;
     private final LimitGuard limitGuard;
+    private final GrantService grantService;
 
     public PrivacyGateway(PolicyStore policyStore, KeyStore keyStore, RecordStore recordStore,
                           CryptoService cryptoService, IngestService ingestService,
                           DecisionService decisionService, MaskingService maskingService,
-                          AuditService auditService, LimitGuard limitGuard) {
+                          AuditService auditService, LimitGuard limitGuard, GrantService grantService) {
         this.policyStore = policyStore;
         this.keyStore = keyStore;
         this.recordStore = recordStore;
@@ -65,6 +67,7 @@ public class PrivacyGateway {
         this.maskingService = maskingService;
         this.auditService = auditService;
         this.limitGuard = limitGuard;
+        this.grantService = grantService;
     }
 
     public IngestReport ingest(String source, String recordId, Map<String, Object> raw, RecordSchema schema) {
@@ -227,6 +230,354 @@ public class PrivacyGateway {
         return p == null ? -1 : p.version();
     }
 
+    /**
+     * 批量路径复用的单条目处理（脱敏批量 / 授权明文导出共用）。
+     * <p>固定调用方给定的策略与密钥版本；本条目的任何异常都在条目内收敛为失败结果，
+     * 绝不外抛影响其他条目。失败结果的 view 恒为 null，不泄漏已解开的中间结果。</p>
+     *
+     * @param mode "ACCESS"（脱敏批量，语义同单条入口）或 "EXPORT"（授权明文导出）
+     */
+    public com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult processBatchItem(
+            String caller, Level clearance, String recordId, boolean rawRequested,
+            List<String> fields, ResolvedGrant grant,
+            Policy policy, int pinnedKeyVersion, long startNanos, String mode) {
+        boolean export = "EXPORT".equals(mode);
+        NormalizedRecord record = recordStore.get(recordId);
+        if (record == null) {
+            String eid = auditService.record(caller, export ? "BATCH_EXPORT" : "BATCH_ACCESS",
+                    recordId, ReasonCode.BAD_REQUEST, policy.version(), pinnedKeyVersion,
+                    null, "记录不存在，跳过该条", Map.of());
+            return new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult(
+                    recordId, false, ReasonCode.BAD_REQUEST, null, List.of(), eid, false,
+                    policy.version(), pinnedKeyVersion);
+        }
+        String inputDigest = safeDigest(record.data());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> view = (Map<String, Object>) JsonCodec.deepCopy(record.data());
+        List<FieldDecision> decisions = new ArrayList<>();
+        boolean[] truncated = {false};
+        AccessRequest effective = new AccessRequest(caller, clearance, recordId, rawRequested);
+
+        try {
+            if (export) {
+                // 明文导出：先把点名范围之外的字段剔除，再按授权解密/放行
+                pruneToFields(view, "$", 1, null, fields, policy, startNanos);
+                exportProcess(view, "$", 1, null, recordId, fields, grant, policy,
+                        effective, decisions, startNanos);
+            } else {
+                pruneToFields(view, "$", 1, null, fields, policy, startNanos);
+                process(view, "$", 1, null, effective, policy, grant, recordId,
+                        decisions, truncated, startNanos);
+            }
+            limitGuard.checkElapsed(startNanos, ReasonCode.ALLOWED);
+        } catch (GatewayException e) {
+            // 条目内失败（含超时/超限/解密失败）：不返回该条任何已处理视图
+            String eid = auditService.record(caller, export ? "BATCH_EXPORT" : "BATCH_ACCESS",
+                    recordId, e.code(), policy.version(), pinnedKeyVersion,
+                    inputDigest, "条目处理失败：" + e.getMessage(),
+                    Map.of("mode", mode));
+            return new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult(
+                    recordId, false, e.code(), null, List.of(), eid, false,
+                    policy.version(), pinnedKeyVersion);
+        }
+
+        boolean denied = decisions.stream().anyMatch(d -> d.action() == FieldAction.DENY);
+        ReasonCode overall;
+        if (denied) {
+            overall = export ? ReasonCode.GRANT_SCOPE_VIOLATION
+                    : ReasonCode.DENIED_UNAUTHORIZED_RAW_READ;
+        } else if (truncated[0]) {
+            overall = ReasonCode.TRUNCATED_BY_LIMIT;
+        } else if (decisions.stream().anyMatch(d -> d.action() == FieldAction.MASK)) {
+            overall = ReasonCode.MASKED_INSUFFICIENT_CLEARANCE;
+        } else {
+            overall = ReasonCode.ALLOWED;
+        }
+
+        int allow = 0, mask = 0, deny = 0;
+        for (FieldDecision dd : decisions) {
+            switch (dd.action()) {
+                case ALLOW -> allow++;
+                case MASK -> mask++;
+                case DENY -> deny++;
+            }
+        }
+        Map<String, String> detail = new LinkedHashMap<>();
+        detail.put("counts", "ALLOW=" + allow + ",MASK=" + mask + ",DENY=" + deny);
+        detail.put("mode", mode);
+        if (grant != null) {
+            detail.put("grantId", grant.grantId());
+        }
+        String eid = auditService.record(caller, export ? "BATCH_EXPORT" : "BATCH_ACCESS",
+                recordId, overall, policy.version(), pinnedKeyVersion,
+                inputDigest, summarize(decisions), detail);
+        LOG.info("[{}] recordId={} caller={} | outcome={} policyV={} keyV={} decisions={}",
+                mode, recordId, caller, overall, policy.version(), pinnedKeyVersion,
+                summarize(decisions));
+
+        // 批量语义：逐条给结论，允许/脱敏/拒绝混排在同一批；
+        // 单条即使有字段被拒（越范围）也不抛异常，由结果中的 deny 判定表达，
+        // 但被拒字段绝不以明文出现在 view 中（遍历时已剔除/置空）。
+        return new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult(
+                recordId, true, overall, view, List.copyOf(decisions), eid, truncated[0],
+                policy.version(), pinnedKeyVersion);
+    }
+
+    /**
+     * 将视图裁剪到“点名字段集合”：fields 为 null/空表示全部保留。
+     * 命中规则与判定一致：键名按策略逻辑名/别名匹配 + {@code {"value":..}} 包装继承父键名。
+     */
+    private void pruneToFields(Object node, String path, int depth, String wrapperField,
+                               List<String> fields, Policy policy, long startNanos) {
+        limitGuard.checkElapsed(startNanos, ReasonCode.ALLOWED);
+        if (fields == null || fields.isEmpty()) {
+            return;
+        }
+        if (node instanceof Map<?, ?> rawMap) {
+            limitGuard.checkDepth(depth);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> map = (Map<String, Object>) rawMap;
+            if (isWrapperMap(map)) {
+                String logical = wrapperField != null ? wrapperField : "value";
+                Object inner = map.get("value");
+                if (named(fields, policy, logical)) {
+                    return; // 整个包装值属于点名字段，全保留
+                }
+                if (isContainerButNotEnvelope(inner)) {
+                    pruneToFields(inner, path + ".value", depth + 1, "value", fields, policy, startNanos);
+                } else {
+                    map.put("value", null);
+                }
+                return;
+            }
+            for (String key : new ArrayList<>(map.keySet())) {
+                Object child = map.get(key);
+                if (named(fields, policy, key)) {
+                    continue;
+                }
+                if (isContainerButNotEnvelope(child)) {
+                    pruneToFields(child, path + "." + key, depth + 1, key, fields, policy, startNanos);
+                    if (isEmptyContainer(child)) {
+                        map.remove(key);
+                    }
+                } else {
+                    map.remove(key);
+                }
+            }
+            return;
+        }
+        if (node instanceof List<?> list) {
+            limitGuard.checkArraySize(list.size());
+            @SuppressWarnings("unchecked")
+            List<Object> arr = (List<Object>) node;
+            for (int i = 0; i < arr.size(); i++) {
+                Object child = arr.get(i);
+                if (isContainerButNotEnvelope(child)) {
+                    String inherited = (child instanceof Map<?, ?> cm && !isWrapperMap(cm))
+                            ? null : wrapperField;
+                    pruneToFields(child, path + "[" + i + "]", depth + 1, inherited,
+                            fields, policy, startNanos);
+                    if (isEmptyContainer(child)) {
+                        arr.remove(i);
+                        i--;
+                    }
+                } else if (wrapperField == null || !named(fields, policy, wrapperField)) {
+                    arr.remove(i);
+                    i--;
+                }
+            }
+        }
+    }
+
+    /** 点名字段是否命中：直接名或经策略别名解析后的逻辑名。 */
+    private boolean named(List<String> fields, Policy policy, String keyName) {
+        if (fields == null || fields.isEmpty()) {
+            return true;
+        }
+        if (fields.contains(keyName)) {
+            return true;
+        }
+        FieldRule rule = decisionService.findRule(policy, keyName);
+        return rule != null && fields.contains(rule.field());
+    }
+
+    private static boolean isContainerButNotEnvelope(Object value) {
+        return (value instanceof Map<?, ?> || value instanceof List<?>)
+                && !AesGcmCryptoService.isEnvelope(value);
+    }
+
+    private static boolean isEmptyContainer(Object value) {
+        if (value instanceof Map<?, ?> m) {
+            return m.isEmpty();
+        }
+        if (value instanceof List<?> l) {
+            return l.isEmpty();
+        }
+        return false;
+    }
+
+    /**
+     * 明文导出遍历：只针对点名字段判定，授权覆盖的字段解密密文信封并保留明文，
+     * 未覆盖（越范围）字段判 DENY(GRANT_SCOPE_VIOLATION) 并从视图剔除/置空，绝不返回明文。
+     * 密文信封作为标量处理（不当容器递归），按信封自身 v 取历史/当前密钥解密。
+     * 与单条入口共用 {@link DecisionService}，授权口径一致。
+     */
+    private void exportProcess(Object node, String path, int depth, String wrapperField,
+                               String recordId, List<String> fields, ResolvedGrant grant,
+                               Policy policy, AccessRequest request,
+                               List<FieldDecision> decisions, long startNanos) {
+        limitGuard.checkElapsed(startNanos, ReasonCode.ALLOWED);
+        if (node instanceof Map<?, ?> rawMap) {
+            limitGuard.checkDepth(depth);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> map = (Map<String, Object>) rawMap;
+            if (isWrapperMap(map)) {
+                String logical = wrapperField != null ? wrapperField : "value";
+                Object inner = map.get("value");
+                if (named(fields, policy, logical)) {
+                    FieldDecision d = decisionService.decide(policy, request, path, logical,
+                            grant, recordId, true);
+                    decisions.add(d);
+                    if (d.action() == FieldAction.DENY) {
+                        map.put("value", null);
+                        return;
+                    }
+                    if (!isContainerButNotEnvelope(inner)) {
+                        // 标量（含密文信封）：覆盖则解密/保留
+                        map.put("value", decryptIfEnvelope(inner));
+                        return;
+                    }
+                }
+                if (isContainerButNotEnvelope(inner)) {
+                    exportProcess(inner, path + ".value", depth + 1, "value",
+                            recordId, fields, grant, policy, request, decisions, startNanos);
+                }
+                return;
+            }
+            for (String key : new ArrayList<>(map.keySet())) {
+                Object child = map.get(key);
+                if (named(fields, policy, key) && !isContainerButNotEnvelope(child)) {
+                    FieldDecision d = decisionService.decide(policy, request, path + "." + key,
+                            key, grant, recordId, true);
+                    decisions.add(d);
+                    if (d.action() == FieldAction.DENY) {
+                        map.remove(key);
+                    } else {
+                        map.put(key, decryptIfEnvelope(child));
+                    }
+                } else if (isContainerButNotEnvelope(child)) {
+                    exportProcess(child, path + "." + key, depth + 1, key,
+                            recordId, fields, grant, policy, request, decisions, startNanos);
+                }
+            }
+            return;
+        }
+        if (node instanceof List<?> list) {
+            limitGuard.checkArraySize(list.size());
+            @SuppressWarnings("unchecked")
+            List<Object> arr = (List<Object>) node;
+            for (int i = 0; i < arr.size(); i++) {
+                Object child = arr.get(i);
+                if (isContainerButNotEnvelope(child)) {
+                    String childWrapper = wrapperField;
+                    if (child instanceof Map<?, ?> cm && !isWrapperMap(cm)) {
+                        childWrapper = null;
+                    }
+                    exportProcess(child, path + "[" + i + "]", depth + 1, childWrapper,
+                            recordId, fields, grant, policy, request, decisions, startNanos);
+                } else if (wrapperField != null && named(fields, policy, wrapperField)) {
+                    FieldDecision d = decisionService.decide(policy, request, path + "[" + i + "]",
+                            wrapperField, grant, recordId, true);
+                    decisions.add(d);
+                    if (d.action() == FieldAction.DENY) {
+                        arr.set(i, null);
+                    } else {
+                        arr.set(i, decryptIfEnvelope(child));
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 单条授权访问的补充遍历：仅解密“授权覆盖的逻辑字段”上的密文信封，
+     * 其他信封原样保留。结构/别名/包装口径与主遍历一致。
+     */
+    private void decryptGrantedRecursively(Object node, String path, int depth, String wrapperField,
+                                           AccessRequest request, Policy policy,
+                                           ResolvedGrant grant, long startNanos) {
+        limitGuard.checkElapsed(startNanos, ReasonCode.ALLOWED);
+        if (node instanceof Map<?, ?> rawMap) {
+            limitGuard.checkDepth(depth);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> map = (Map<String, Object>) rawMap;
+            if (isWrapperMap(map)) {
+                String logical = wrapperField != null ? wrapperField : "value";
+                Object inner = map.get("value");
+                FieldRule rule = decisionService.findRule(policy, logical);
+                String canonical = rule == null ? logical : rule.field();
+                if (grant.covers(request.recordId(), canonical)
+                        && AesGcmCryptoService.isEnvelope(inner)) {
+                    CipherEnvelope env = AesGcmCryptoService.fromMap(asMap(inner));
+                    map.put("value", cryptoService.decrypt(env));
+                    return;
+                }
+                if (isContainerButNotEnvelope(inner)) {
+                    decryptGrantedRecursively(inner, path + ".value", depth + 1, "value",
+                            request, policy, grant, startNanos);
+                }
+                return;
+            }
+            for (Map.Entry<String, Object> e : new ArrayList<>(map.entrySet())) {
+                String key = e.getKey();
+                Object child = e.getValue();
+                FieldRule rule = decisionService.findRule(policy, key);
+                String canonical = rule == null ? key : rule.field();
+                if (grant.covers(request.recordId(), canonical)
+                        && AesGcmCryptoService.isEnvelope(child)) {
+                    CipherEnvelope env = AesGcmCryptoService.fromMap(asMap(child));
+                    map.put(key, cryptoService.decrypt(env));
+                } else if (isContainerButNotEnvelope(child)) {
+                    decryptGrantedRecursively(child, path + "." + key, depth + 1, key,
+                            request, policy, grant, startNanos);
+                }
+            }
+            return;
+        }
+        if (node instanceof List<?> list) {
+            limitGuard.checkArraySize(list.size());
+            @SuppressWarnings("unchecked")
+            List<Object> arr = (List<Object>) node;
+            for (int i = 0; i < arr.size(); i++) {
+                Object child = arr.get(i);
+                if (isContainerButNotEnvelope(child)) {
+                    String childWrapper = wrapperField;
+                    if (child instanceof Map<?, ?> cm && !isWrapperMap(cm)) {
+                        childWrapper = null;
+                    }
+                    decryptGrantedRecursively(child, path + "[" + i + "]", depth + 1,
+                            childWrapper, request, policy, grant, startNanos);
+                } else if (wrapperField != null && AesGcmCryptoService.isEnvelope(child)) {
+                    FieldRule rule = decisionService.findRule(policy, wrapperField);
+                    String canonical = rule == null ? wrapperField : rule.field();
+                    if (grant.covers(request.recordId(), canonical)) {
+                        CipherEnvelope env = AesGcmCryptoService.fromMap(asMap(child));
+                        arr.set(i, cryptoService.decrypt(env));
+                    }
+                }
+            }
+        }
+    }
+
+    /** 若是密文信封则按信封自身 v 用历史/当前密钥解密；历史密文在轮换后同样可解。 */
+    private Object decryptIfEnvelope(Object value) {
+        if (AesGcmCryptoService.isEnvelope(value)) {
+            CipherEnvelope env = AesGcmCryptoService.fromMap(asMap(value));
+            return cryptoService.decrypt(env);
+        }
+        return value;
+    }
+
     public AccessResponse access(AccessRequest request) {
         long start = System.nanoTime();
         NormalizedRecord record = recordStore.get(request.recordId());
@@ -251,13 +602,34 @@ public class PrivacyGateway {
         }
         inputDigest = safeDigest(record.data());
 
+        // 若携带限时明文授权，先严格校验（跨调用方/过期/撤销/缺失都会在这里受控拒绝并留痕）；
+        // 校验通过后与持证等级等效参与字段判定，保证单条/批量口径一致。
+        ResolvedGrant grant = null;
+        if (request.grantId() != null && !request.grantId().isBlank()) {
+            grant = grantService.validate(request.caller(), request.grantId());
+        }
+
         @SuppressWarnings("unchecked")
         Map<String, Object> view = (Map<String, Object>) JsonCodec.deepCopy(record.data());
         List<FieldDecision> decisions = new ArrayList<>();
         boolean[] truncated = {false};
 
-        process(view, "$", 1, null, request, policy, decisions, truncated, start);
+        process(view, "$", 1, null, request, policy, grant, request.recordId(),
+                decisions, truncated, start);
+        // 单条携带限时授权：授权覆盖字段的密文信封需解密为明文（与批量导出口径一致），
+        // 其余字段的信封保持原样（普通访问从不解密）
+        if (grant != null) {
+            decryptGrantedRecursively(view, "$", 1, null, request, policy, grant, start);
+        }
         limitGuard.checkElapsed(start, ReasonCode.ALLOWED);
+        // 交付前复核授权：处理期间被并发撤销/过期则整单拒绝，不返回明文
+        if (grant != null && !grantService.stillValid(grant, System.currentTimeMillis())) {
+            String revokeEid = auditService.record(request.caller(), "ACCESS", request.recordId(),
+                    ReasonCode.GRANT_REVOKED, policy.version(), pinnedKeyVersion, inputDigest,
+                    "授权在处理期间被撤销或过期，拒绝交付", Map.of("grantId", grant.grantId()));
+            throw new GatewayException(ReasonCode.GRANT_REVOKED,
+                    "授权已失效，拒绝交付，见审计事件 " + revokeEid);
+        }
 
         boolean denied = decisions.stream().anyMatch(d -> d.action() == FieldAction.DENY);
         ReasonCode overall;
@@ -311,6 +683,7 @@ public class PrivacyGateway {
      */
     private void process(Object node, String path, int depth, String wrapperField,
                          AccessRequest request, Policy policy,
+                         ResolvedGrant grant, String recordId,
                          List<FieldDecision> decisions, boolean[] truncated, long startNanos) {
         limitGuard.checkElapsed(startNanos, ReasonCode.ALLOWED);
         if (node instanceof Map<?, ?> rawMap) {
@@ -321,30 +694,39 @@ public class PrivacyGateway {
             if (isWrapperMap(map)) {
                 // {"value": x} / {"type":t,"value":x}：以父键逻辑名对整体判定一次
                 String logical = wrapperField != null ? wrapperField : "value";
-                FieldDecision d = decisionService.decide(policy, request, path, logical);
+                FieldDecision d = decisionService.decide(policy, request, path, logical,
+                        grant, recordId);
                 decisions.add(d);
                 if (d.action() == FieldAction.DENY) {
+                    // 批量逐条返回时必须剔除被拒字段原值，杜绝明文随视图泄漏；
+                    // 单条路径最终也会整单拒绝，行为不受影响
+                    map.put("value", null);
                     return;
                 }
                 Object inner = map.get("value");
-                if (d.action() == FieldAction.MASK && !(inner instanceof Map<?, ?> || inner instanceof List<?>)) {
+                if (d.action() == FieldAction.MASK && !isContainerButNotEnvelope(inner)) {
                     map.put("value", maskingService.mask(inner, decisionService.findRule(policy, logical)));
                     return;
                 }
-                // ALLOW，或内层仍为容器：继续递归，保证深层同名字段不漏
-                process(inner, path + ".value", depth + 1, "value",
-                        request, policy, decisions, truncated, startNanos);
+                // ALLOW，或内层仍为（非信封）容器：继续递归，保证深层同名字段不漏；
+                // 密文信封是不透明标量，按逻辑字段整体判定后原样保留，不解密也不展开
+                if (isContainerButNotEnvelope(inner)) {
+                    process(inner, path + ".value", depth + 1, "value",
+                            request, policy, grant, recordId, decisions, truncated, startNanos);
+                }
                 return;
             }
 
             for (Map.Entry<String, Object> e : new ArrayList<>(map.entrySet())) {
                 String key = e.getKey();
                 Object child = e.getValue();
-                if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                // 密文信封是不透明标量叶子：按键逻辑字段判定，不展开（展开会把加密载荷当普通 JSON）
+                if (isContainerButNotEnvelope(child)) {
                     process(child, path + "." + key, depth + 1, key,
-                            request, policy, decisions, truncated, startNanos);
+                            request, policy, grant, recordId, decisions, truncated, startNanos);
                 } else {
-                    applyScalar(map, key, key, path + "." + key, child, request, policy, decisions);
+                    applyScalar(map, key, key, path + "." + key, child, request, policy,
+                            grant, recordId, decisions);
                 }
             }
             return;
@@ -364,15 +746,16 @@ public class PrivacyGateway {
                 Object child = arr.get(i);
                 // 数组元素继承包装父键逻辑名；普通元素自身若为对象则在内部按键判定
                 String childWrapper = wrapperField;
-                if (child instanceof Map<?, ?> cm && !isWrapperMap(cm)) {
+                if (child instanceof Map<?, ?> cm && !isWrapperMap(cm)
+                        && !AesGcmCryptoService.isEnvelope(child)) {
                     childWrapper = null;
                 }
-                if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                if (isContainerButNotEnvelope(child)) {
                     process(child, path + "[" + i + "]", depth + 1, childWrapper,
-                            request, policy, decisions, truncated, startNanos);
+                            request, policy, grant, recordId, decisions, truncated, startNanos);
                 } else {
                     applyScalar(arr, i, wrapperField, path + "[" + i + "]", child,
-                            request, policy, decisions);
+                            request, policy, grant, recordId, decisions);
                 }
             }
             return;
@@ -385,7 +768,8 @@ public class PrivacyGateway {
 
     private void applyScalar(Object holder, Object keyOrIndex, String logicalField,
                              String path, Object value, AccessRequest request,
-                             Policy policy, List<FieldDecision> decisions) {
+                             Policy policy, ResolvedGrant grant, String recordId,
+                             List<FieldDecision> decisions) {
         if (logicalField == null) {
             return;
         }
@@ -393,7 +777,8 @@ public class PrivacyGateway {
         if (rule == null) {
             return;
         }
-        FieldDecision d = decisionService.decide(policy, request, path, logicalField);
+        FieldDecision d = decisionService.decide(policy, request, path, logicalField,
+                grant, recordId);
         decisions.add(d);
         if (d.action() == FieldAction.MASK) {
             Object masked = maskingService.mask(value, rule);
@@ -406,8 +791,19 @@ public class PrivacyGateway {
                 List<Object> arr = (List<Object>) list;
                 arr.set((Integer) keyOrIndex, masked);
             }
+        } else if (d.action() == FieldAction.DENY) {
+            // 批量逐条返回：被拒字段从视图剔除（Map 删键 / List 置 null），绝不返回原值
+            if (holder instanceof Map<?, ?> map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> m = (Map<String, Object>) map;
+                m.remove((String) keyOrIndex);
+            } else if (holder instanceof List<?> list) {
+                @SuppressWarnings("unchecked")
+                List<Object> arr = (List<Object>) list;
+                arr.set((Integer) keyOrIndex, null);
+            }
         }
-        // DENY：不替换，最终整单拒绝，不泄漏任何字段
+        // 注：单条入口 raw 越权最终整单拒绝；剔除仅用于批量逐条视图的失败安全
     }
 
     private static boolean isWrapperMap(Object value) {

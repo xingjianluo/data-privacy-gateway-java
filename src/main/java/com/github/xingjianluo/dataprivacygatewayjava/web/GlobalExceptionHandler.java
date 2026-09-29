@@ -19,10 +19,15 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(GatewayException.class)
     public ResponseEntity<Map<String, Object>> handleGateway(GatewayException ex) {
         HttpStatus status = switch (ex.code()) {
-            case DENIED_UNAUTHORIZED_RAW_READ -> HttpStatus.FORBIDDEN;
-            case BAD_REQUEST, MALFORMED_ENVELOPE -> HttpStatus.BAD_REQUEST;
+            case DENIED_UNAUTHORIZED_RAW_READ,
+                 GRANT_CALLER_MISMATCH, GRANT_EXPIRED, GRANT_REVOKED,
+                 GRANT_SCOPE_VIOLATION -> HttpStatus.FORBIDDEN;
+            case GRANT_NOT_FOUND, GRANT_INVALID,
+                 BAD_REQUEST, MALFORMED_ENVELOPE -> HttpStatus.BAD_REQUEST;
             case KEY_VERSION_MISSING, POLICY_VERSION_NOT_FOUND -> HttpStatus.CONFLICT;
             case REQUEST_TIMEOUT -> HttpStatus.REQUEST_TIMEOUT;
+            case REJECT_BATCH_TOO_LARGE -> HttpStatus.PAYLOAD_TOO_LARGE;
+            case DUPLICATE_REQUEST -> HttpStatus.CONFLICT;
             default -> HttpStatus.UNPROCESSABLE_ENTITY;
         };
         LOG.warn("[GATEWAY-ERROR] code={} message={}", ex.code(), ex.getMessage());

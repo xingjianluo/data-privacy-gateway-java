@@ -92,25 +92,93 @@ REJECT 模式超限直接拒绝；TRUNCATE 模式仅对过深子树与超长数�
 `TRUNCATED_BY_LIMIT`；字符串与整体字节规模在任何模式下都拒绝。处理全程在深拷贝副本上
 进行，失败时不写半成品、不泄漏解密中间结果。
 
-## 8. REST 速览
+## 8. 批量访问与限时明文授权（feature-b）
+
+在单条字段级判定之上新增两条使用路径，判定口径与既有单条能力**完全一致**——
+同一逻辑字段，无论从单条入口还是批量入口取，允许/脱敏/拒绝结论相同。
+
+### 8.1 批量脱敏访问 `POST /api/gateway/batch/access`
+
+- 请求一次可带多条记录，每条可只点名 `fields`（空/省略表示全部），裁剪按
+  策略**逻辑名/别名**匹配，嵌套、数组、`{"value":..}` 包装口径与单条一致。
+- 返回**逐条**结论 `results[]`：`ok / reason / view / decisions / auditEventId /
+  truncated / policyVersion / keyVersion`。允许、脱敏、拒绝在同一条内也分得清；
+  被 DENY 的字段不出现在该条 `view` 中（Map 删键、List 置 null）。
+- **单条隔离**：某条记录不存在或处理失败只把该条标为 `ok=false`（`view=null` 且带
+  独立审计事件），不拖垮、不影响其他条目。
+- **版本固定**：批量开始时固定一个策略快照版本与一个当前密钥版本戳，整批所有条目都
+  对应这一确定版本；期间策略发布 / 密钥轮换不会造成半新半旧。
+- **规模 / 耗时**：条数与整批时限可配（`privacy-gateway.batch.*`）。
+  - REJECT 模式：条数超限整批拒绝（`REJECT_BATCH_TOO_LARGE`），不处理任何条目；
+  - TRUNCATE 模式：截断到约定条数，结果以 `truncated=true` + `TRUNCATED_BY_LIMIT` 标明；
+  - 超时：整批失败（`REQUEST_TIMEOUT`），不返回任何已处理视图，不留中间明文，可安全重试。
+- **幂等**：可带 `requestId`；相同 `caller + requestId` 的并发或重试请求被拒绝
+  （`DUPLICATE_REQUEST`）并指向首个事件，处理失败会回滚占位，不重复计数。
+
+### 8.2 限时明文授权与批量导出
+
+明文导出在字段级判定之外再收紧一层，必须持有一张**限时授权**：
+
+- 授权四要素绑定：`caller`（调用方）、`records`（记录范围）、`fields`（字段范围，
+  按策略逻辑名）、`expiresAt`（有效期，TTL 受 `max-grant-ttl-millis` 上限约束）。
+- 发放后不可变；可随时撤销（`DELETE /grants/{id}`，仅绑定调用方可撤销自己的）。
+- 使用授权时严格校验，每种失败都有独立原因码且**全部留痕**：
+  `GRANT_NOT_FOUND / GRANT_CALLER_MISMATCH（跨调用方）/ GRANT_EXPIRED /
+  GRANT_REVOKED / GRANT_INVALID`；
+  点名字段超出字段范围：该字段判 `DENY(GRANT_SCOPE_VIOLATION)` 且明文不出现；
+  请求记录超出记录范围：**整批拒绝**（`GRANT_SCOPE_VIOLATION`），一条越界也不处理。
+- **双时点校验**：批量开始前校验一次，全部条目处理完、交付前再复核一次；
+  授权在处理期间被并发撤销或恰好过期，整批拒绝交付，已解开的明文一律不返回。
+- **密文处理**：授权覆盖字段的密文信封按信封自身 `v` 取历史密钥解密，
+  因此**密钥轮换后批量导出仍能正确解密历史密文**；未授权字段的信封不展开、不解密。
+  （密文信封在判定遍历时是不透明标量叶子，不会被当普通 JSON 递归。）
+- 单条入口同样支持 `grantId`（见下），授权字段的信封也会解密；授权只对覆盖字段生效，
+  未覆盖字段回到常规脱敏口径，不会因为“带了授权 + raw”而被额外拒绝。
+
+## 9. REST 速览
 
 ```
 POST /api/gateway/records                 接入（body: recordId, source, data, schema?）
-GET  /api/gateway/records/{id}?caller=&clearance=&raw=   字段级判定访问
+GET  /api/gateway/records/{id}?caller=&clearance=&raw=&grantId=   字段级判定访问（grantId 可选）
 POST /api/gateway/policy/versions         发布新策略（完整规则数组）
 POST /api/gateway/keys/rotate             密钥轮换
 POST /api/gateway/records/{id}/encrypt    按逻辑字段名加密（body: {"fields":["phone"]}）
 POST /api/gateway/records/{id}/decrypt?caller=ops        解密（明文不落库）
+
+# 批量与限时授权
+POST /api/gateway/batch/access            批量脱敏访问
+POST /api/gateway/batch/export            批量明文导出（需 grantId）
+POST /api/gateway/grants                  发放限时授权（caller, records, fields, ttlMillis）
+GET    /api/gateway/grants/{id}           查询授权状态（ACTIVE/REVOKED/NOT_FOUND）
+DELETE /api/gateway/grants/{id}?caller=   撤销授权（仅绑定调用方）
+```
+
+批量请求体示例：
+
+```json
+// batch/access
+{"caller":"guest","clearance":"PUBLIC","raw":false,"requestId":"可选幂等键",
+ "items":[{"recordId":"u1","fields":["phone"]},{"recordId":"u2"}]}
+
+// 发放授权
+{"caller":"auditor","records":["u1","u2"],"fields":["idCard"],"ttlMillis":300000}
+
+// batch/export
+{"caller":"auditor","clearance":"PUBLIC","grantId":"<上一步返回>","requestId":"exp-1",
+ "items":[{"recordId":"u1","fields":["idCard"]}]}
 ```
 
 错误响应统一为 `{"ok":false,"reason":"<ReasonCode>","message":"<受控消息>"}`。
 
-## 9. 验证方法
+## 10. 验证方法
 
 ```bash
-mvn -o test                 # 离线全量测试（27 个用例）
+mvn -o test                 # 离线全量测试（45 个用例：27 既有 + 18 新增）
 mvn -o test -Dtest=KeyRotationTest       # 只跑密钥轮换
 mvn -o test -Dtest=ConcurrencyUpdateTest # 只跑并发更新
+mvn -o test -Dtest=BatchAccessTest       # 只跑批量访问
+mvn -o test -Dtest=GrantExportTest       # 只跑限时授权/导出
+mvn -o test -Dtest=BatchLimitConcurrencyTest # 只跑超限/超时/幂等/并发撤销
 mvn spring-boot:run         # 启动服务（播种密钥 v1、策略 v1）
 ```
 
@@ -125,8 +193,45 @@ mvn spring-boot:run         # 启动服务（播种密钥 v1、策略 v1）
 - `ConcurrencyUpdateTest`：策略/密钥并发发布版本唯一单调、历史可读、读写版本自洽
 - `AuditRetentionTest`：四类结论留痕、审计失败不影响主结论、TTL 整条清除
 - `LimitGuardTest`：REJECT/TRUNCATE、深度/数组/耗时超限、拒绝无半成品
+- `BatchAccessTest`：同批混合允许/脱敏/拒绝逐条可分；单条坏记录不拖垮整批；
+  点名字段裁剪；空批整批拒绝；整批固定同一 policy/key 版本戳
+- `GrantExportTest`：授权批量导出解密信封；字段/记录越范围、跨调用方、过期、撤销均拒绝
+  且留痕；单条与批量授权口径一致；轮换后批量解密历史密文；非法授权参数拒绝
+- `BatchLimitConcurrencyTest`：REJECT 整批拒绝 / TRUNCATE 截断并标记；
+  超时整批失败无中间结果；`requestId` 并发/重试幂等、失败后可安全重试；
+  处理期间并发撤销授权整批拒绝
 
-### curl 示例
+### curl 端到端验证（批量 + 限时授权）
+
+```bash
+# 1) 接入并加密敏感字段
+curl -s -XPOST localhost:8080/api/gateway/records -H 'Content-Type: application/json' -d '{
+  "recordId":"u1","source":"crm",
+  "data":{"name":"Alice","phone":"13800001111","idCard":"11010119900101001X"}}'
+curl -s -XPOST localhost:8080/api/gateway/records/u1/encrypt -H 'Content-Type: application/json' \
+  -d '{"fields":["phone","idCard"]}'
+
+# 2) 批量脱敏访问：PUBLIC 调用方拿到的是密文/脱敏视图，逐条带判定依据与版本戳
+curl -s -XPOST localhost:8080/api/gateway/batch/access -H 'Content-Type: application/json' -d '{
+  "caller":"guest","clearance":"PUBLIC",
+  "items":[{"recordId":"u1","fields":["phone","idCard"]}]}'
+
+# 3) 发放限时授权（绑定调用方/记录/字段/有效期）
+curl -s -XPOST localhost:8080/api/gateway/grants -H 'Content-Type: application/json' -d '{
+  "caller":"auditor","records":["u1"],"fields":["idCard"],"ttlMillis":300000}'
+# 用返回的 grantId 导出：idCard 解密为明文；换成 phone（不在字段范围）该字段被 DENY
+curl -s -XPOST localhost:8080/api/gateway/batch/export -H 'Content-Type: application/json' -d '{
+  "caller":"auditor","clearance":"PUBLIC","grantId":"<grantId>","requestId":"exp-1",
+  "items":[{"recordId":"u1","fields":["idCard"]}]}'
+
+# 4) 越界 / 换人 / 过期 / 撤销都会被拒绝并留痕
+curl -s -XDELETE 'localhost:8080/api/gateway/grants/<grantId>?caller=auditor'
+curl -s -XPOST localhost:8080/api/gateway/batch/export -H 'Content-Type: application/json' -d '{
+  "caller":"auditor","clearance":"PUBLIC","grantId":"<grantId>","requestId":"exp-2",
+  "items":[{"recordId":"u1","fields":["idCard"]}]}'   # -> 403 GRANT_REVOKED
+```
+
+### curl 单条速查
 
 ```bash
 curl -s -XPOST localhost:8080/api/gateway/records -H 'Content-Type: application/json' -d '{
