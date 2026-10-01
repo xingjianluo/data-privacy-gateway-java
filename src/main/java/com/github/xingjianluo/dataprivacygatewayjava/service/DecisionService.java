@@ -40,6 +40,15 @@ public class DecisionService {
                 request.clearance(), required, policy.version());
     }
 
+    /**
+     * 点名的逻辑字段在记录任何层级/包装/别名下都不存在或取不到：
+     * 显式给出 NOT_FOUND 依据，绝不允许用「空结果 + ALLOW」含糊带过。
+     */
+    public FieldDecision notFound(Policy policy, AccessRequest request, String field) {
+        return new FieldDecision("$", field, FieldAction.NOT_FOUND, ReasonCode.FIELD_NOT_FOUND,
+                request.clearance(), Level.PUBLIC, policy.version());
+    }
+
     /** 按字段逻辑名或别名匹配；规则中无该字段返回 null。 */
     public FieldRule findRule(Policy policy, String field) {
         if (policy == null || field == null) {

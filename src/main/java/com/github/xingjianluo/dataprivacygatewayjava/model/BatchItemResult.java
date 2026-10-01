@@ -4,8 +4,10 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 批量结果中的单条结论：允许 / 脱敏 / 拒绝 / 失败混在同一批里也能逐条区分。
- * view 仅在成功（ALLOWED / MASKED / TRUNCATED）时非空；拒绝与失败不携带任何字段视图。
+ * 批量结果中的单条结论：允许 / 脱敏 / 拒绝 / 失败 / 点名字段不存在混在同一批里也能逐条区分。
+ * view 仅在成功（ALLOWED / MASKED / TRUNCATED / FIELD_NOT_FOUND）时非空；
+ * 拒绝与处理失败不携带任何字段视图。FIELD_NOT_FOUND 表示记录可取、但点名的部分字段
+ * 在任何层级/包装/别名下都不存在，view 中只含确实取到的点名字段。
  */
 public final class BatchItemResult {
     private final String recordId;
@@ -35,7 +37,8 @@ public final class BatchItemResult {
     public boolean ok() {
         return outcome == ReasonCode.ALLOWED
                 || outcome == ReasonCode.MASKED_INSUFFICIENT_CLEARANCE
-                || outcome == ReasonCode.TRUNCATED_BY_LIMIT;
+                || outcome == ReasonCode.TRUNCATED_BY_LIMIT
+                || outcome == ReasonCode.FIELD_NOT_FOUND;
     }
 
     public String recordId() { return recordId; }

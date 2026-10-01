@@ -27,7 +27,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -54,13 +53,14 @@ public class PrivacyGateway {
     private final AuditService auditService;
     private final LimitGuard limitGuard;
     private final GrantService grantService;
+    private final FieldSelectionService fieldSelectionService;
     private final com.github.xingjianluo.dataprivacygatewayjava.config.GatewayProperties batchProps;
 
     public PrivacyGateway(PolicyStore policyStore, KeyStore keyStore, RecordStore recordStore,
                           CryptoService cryptoService, IngestService ingestService,
                           DecisionService decisionService, MaskingService maskingService,
                           AuditService auditService, LimitGuard limitGuard,
-                          GrantService grantService,
+                          GrantService grantService, FieldSelectionService fieldSelectionService,
                           com.github.xingjianluo.dataprivacygatewayjava.config.GatewayProperties properties) {
         this.policyStore = policyStore;
         this.keyStore = keyStore;
@@ -72,6 +72,7 @@ public class PrivacyGateway {
         this.auditService = auditService;
         this.limitGuard = limitGuard;
         this.grantService = grantService;
+        this.fieldSelectionService = fieldSelectionService;
         this.batchProps = properties;
     }
 
@@ -230,6 +231,68 @@ public class PrivacyGateway {
         return (Map<?, ?>) value;
     }
 
+    /**
+     * 导出专用：只解密字段级判定为 ALLOW 的密文信封（路径集合来自本次字段判定），
+     * 判定为 MASK / 无规则命中的信封原样保留。路径口径与 {@link #process} 严格一致：
+     * 普通对象按键、数组元素继承直接父键（普通对象元素内部重置）、包装以父逻辑名判定。
+     */
+    private void decryptAllowedRecursively(Object node, String path, String wrapperField,
+                                           java.util.Set<String> allowedPaths, long startNanos) {
+        limitGuard.checkElapsed(startNanos, ReasonCode.ALLOWED);
+        if (node instanceof Map<?, ?> rawMap) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> map = (Map<String, Object>) rawMap;
+            if (isWrapperMap(map)) {
+                String logical = wrapperField != null ? wrapperField : "value";
+                boolean allowed = allowedPaths.contains(path);
+                Object inner = map.get("value");
+                if (allowed && AesGcmCryptoService.isEnvelope(inner)) {
+                    CipherEnvelope env = AesGcmCryptoService.fromMap(asMap(inner));
+                    map.put("value", cryptoService.decrypt(env));
+                } else if (inner instanceof Map<?, ?> || inner instanceof List<?>) {
+                    decryptAllowedRecursively(inner, path + ".value", "value",
+                            allowedPaths, startNanos);
+                }
+                return;
+            }
+            for (Map.Entry<String, Object> e : new ArrayList<>(map.entrySet())) {
+                Object child = e.getValue();
+                String childPath = path + "." + e.getKey();
+                if (AesGcmCryptoService.isEnvelope(child)) {
+                    if (allowedPaths.contains(childPath)) {
+                        map.put(e.getKey(),
+                                cryptoService.decrypt(AesGcmCryptoService.fromMap(asMap(child))));
+                    }
+                } else if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                    decryptAllowedRecursively(child, childPath, e.getKey(),
+                            allowedPaths, startNanos);
+                }
+            }
+            return;
+        }
+        if (node instanceof List<?> list) {
+            @SuppressWarnings("unchecked")
+            List<Object> arr = (List<Object>) node;
+            for (int i = 0; i < arr.size(); i++) {
+                Object child = arr.get(i);
+                String childPath = path + "[" + i + "]";
+                String childWrapper = wrapperField;
+                if (child instanceof Map<?, ?> cm && !isWrapperMap(cm)) {
+                    childWrapper = null;
+                }
+                if (AesGcmCryptoService.isEnvelope(child)) {
+                    if (allowedPaths.contains(childPath)) {
+                        arr.set(i,
+                                cryptoService.decrypt(AesGcmCryptoService.fromMap(asMap(child))));
+                    }
+                } else if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                    decryptAllowedRecursively(child, childPath, childWrapper,
+                            allowedPaths, startNanos);
+                }
+            }
+        }
+    }
+
     public long currentPolicyVersion() {
         Policy p = policyStore.current();
         return p == null ? -1 : p.version();
@@ -288,6 +351,7 @@ public class PrivacyGateway {
                     case ALLOW -> allow++;
                     case MASK -> mask++;
                     case DENY -> deny++;
+                    case NOT_FOUND -> { /* 单条入口不产生 NOT_FOUND，防御性忽略 */ }
                 }
             }
             detail.put("counts", "ALLOW=" + allow + ",MASK=" + mask + ",DENY=" + deny);
@@ -320,8 +384,10 @@ public class PrivacyGateway {
 
     /**
      * 批量明文导出：在批量访问之上叠加限时授权校验（调用方 / 记录范围 / 字段范围 / 有效期）。
-     * 授权只收紧不放宽：字段级判定沿用与单条入口相同的 raw 口径，
-     * 授权范围内判定为 ALLOW 的密文信封按信封版本解密（轮换后历史密文仍可解开）。
+     * 授权只收紧不放宽：字段级判定沿用与普通批量访问<b>完全相同</b>的口径（同一调用方持证等级
+     * 与同一 raw 语义），因此对同一份数据、同一批点名字段，两个入口的结论逐项一致；
+     * 授权范围内判定为 ALLOW 的密文信封按信封版本解密（轮换后历史密文仍可解开），
+     * 低权限会脱敏的字段在导出中同样脱敏（脱敏后的令牌不涉及解密）。
      * 明文只存在于返回视图中，不落库；中途失败/超时整批丢弃，不留已解开的中间结果。
      */
     public BatchResponse batchExport(String grantId, BatchAccessRequest request) {
@@ -337,7 +403,8 @@ public class PrivacyGateway {
                     "导出授权校验失败：" + e.getMessage(), Map.of("grantId", String.valueOf(grantId)));
             throw e;
         }
-        // 导出口径：raw 语义；条目未点名字段时收敛为授权字段范围（空=全部仅限授权范围内）
+        // 导出口径：沿用调用方自己的 raw 语义（与普通批量访问完全一致）；
+        // 条目未点名字段时收敛为授权字段范围（空选择 ≠ 全表导出）
         List<com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem> items = new ArrayList<>();
         for (com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item : request.items()) {
             items.add(item.fields().isEmpty()
@@ -346,7 +413,7 @@ public class PrivacyGateway {
                     : item);
         }
         BatchAccessRequest exportRequest = new BatchAccessRequest(
-                request.caller(), request.clearance(), true, items);
+                request.caller(), request.clearance(), request.rawRequested(), items);
         return doBatch(exportRequest, grant, "BATCH_EXPORT", true);
     }
 
@@ -408,9 +475,9 @@ public class PrivacyGateway {
             if (recordId == null || recordId.isBlank()) {
                 throw new GatewayException(ReasonCode.BAD_REQUEST, "条目缺少 recordId");
             }
-            // 导出口径：授权范围逐条校验（记录范围 + 字段范围）
+            // 导出口径：授权范围逐条校验（记录范围 + 字段范围，字段别名归一）
             if (grant != null) {
-                checkGrantScope(grant, item);
+                checkGrantScope(grant, item, policy);
             }
             NormalizedRecord record = recordStore.get(recordId);
             if (record == null) {
@@ -418,18 +485,26 @@ public class PrivacyGateway {
             }
             @SuppressWarnings("unchecked")
             Map<String, Object> view = (Map<String, Object>) JsonCodec.deepCopy(record.data());
-            // 条目点名了字段：只保留命中的顶层逻辑字段（含别名归一）
+            // 条目点名了字段：深层定位命中（子对象/数组/包装/别名同口径），
+            // 只保留命中字段与通向它的容器链；同时得到与裁剪视图一一对应的命中清单
+            List<FieldSelectionService.FieldHit> hits;
             if (!item.fields().isEmpty()) {
-                view = selectFields(view, item.fields(), policy);
+                FieldSelectionService.PrunedView pruned =
+                        fieldSelectionService.prune(view, item.fields(), policy);
+                view = pruned.view();
+                hits = pruned.hits();
+            } else {
+                hits = List.of();
             }
             AccessRequest single = new AccessRequest(request.caller(), request.clearance(),
                     recordId, request.rawRequested());
             List<FieldDecision> decisions = new ArrayList<>();
             boolean[] truncated = {false};
             process(view, "$", 1, null, single, policy, decisions, truncated, startNanos);
-            addImplicitAllowDecisions(view, item, request, policy, decisions);
+            addFieldSelectionDecisions(view, item, single, policy, decisions, hits);
 
             boolean denied = decisions.stream().anyMatch(d -> d.action() == FieldAction.DENY);
+            boolean notFound = decisions.stream().anyMatch(d -> d.action() == FieldAction.NOT_FOUND);
             ReasonCode outcome;
             if (denied) {
                 outcome = ReasonCode.DENIED_UNAUTHORIZED_RAW_READ;
@@ -437,6 +512,9 @@ public class PrivacyGateway {
                 outcome = ReasonCode.TRUNCATED_BY_LIMIT;
             } else if (decisions.stream().anyMatch(d -> d.action() == FieldAction.MASK)) {
                 outcome = ReasonCode.MASKED_INSUFFICIENT_CLEARANCE;
+            } else if (notFound) {
+                // 点名字段不存在/取不到：如实告知，绝不用空结果冒充允许
+                outcome = ReasonCode.FIELD_NOT_FOUND;
             } else {
                 outcome = ReasonCode.ALLOWED;
             }
@@ -446,13 +524,22 @@ public class PrivacyGateway {
             // 与单条入口一致的失败安全：越权取原文的条目不返回任何字段视图
             Map<String, Object> resultView = denied ? null : view;
             if (resultView != null && decrypt) {
-                // 明文导出：解开视图中的密文信封（按信封版本取历史密钥，轮换后仍可解）。
+                // 明文导出：只解开字段级判定为 ALLOW 的密文信封（按信封版本取历史密钥，
+                // 轮换后仍可解）；被 MASK 的字段信封原样保留，授权绝不放宽到越权解密。
                 // 解密失败抛 GatewayException，由外层 catch 收敛为该条目失败，不影响其他条目。
-                decryptRecursively(resultView, startNanos);
+                java.util.Set<String> allowedPaths = new java.util.HashSet<>();
+                for (FieldDecision d : decisions) {
+                    if (d.action() == FieldAction.ALLOW) {
+                        allowedPaths.add(d.path());
+                    }
+                }
+                decryptAllowedRecursively(resultView, "$", null, allowedPaths, startNanos);
             }
+            String message = denied ? "越权读取原始值被拒绝"
+                    : notFound ? describeNotFound(decisions) : null;
             return new com.github.xingjianluo.dataprivacygatewayjava.model.BatchItemResult(
                     recordId, outcome, resultView, decisions, policy.version(), pinnedKeyVersion,
-                    eventId, truncated[0], denied ? "越权读取原始值被拒绝" : null);
+                    eventId, truncated[0], message);
         } catch (GatewayException e) {
             if (e.code() == ReasonCode.REQUEST_TIMEOUT) {
                 // 超时是批次级结论：整批失败，已处理/已解开的中间视图随异常一并丢弃
@@ -468,60 +555,82 @@ public class PrivacyGateway {
     }
 
     /**
-     * 批量路径补充：无规则字段按 PUBLIC 显式补一条 ALLOW 判定依据，
-     * 让每条结果都能给出完整依据（单条入口行为保持不变）。
+     * 批量路径补齐判定依据，保证「点名的每个逻辑字段」都有一条属于自己的依据：
+     * <ul>
+     *   <li>有规则字段（含嵌套/数组/包装/别名的每一处出现）由递归处理产出，这里不重复；</li>
+     *   <li>无规则字段的每一处出现显式补一条 ALLOW(PUBLIC) 依据；</li>
+     *   <li>点名但在记录任何层级都不存在/取不到的逻辑字段，补一条 NOT_FOUND 依据，
+     *       绝不允许返回空依据却报允许；</li>
+     *   <li>未点名字段（fields 为空）时，沿用原约定：按顶层键为无规则字段补 ALLOW 依据。</li>
+     * </ul>
      */
-    private void addImplicitAllowDecisions(Map<String, Object> view,
-                                           com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item,
-                                           BatchAccessRequest request, Policy policy,
-                                           List<FieldDecision> decisions) {
-        List<String> candidates = item.fields().isEmpty()
-                ? List.copyOf(view.keySet())
-                : item.fields();
-        for (String f : candidates) {
-            if (decisionService.findRule(policy, f) != null) {
-                continue; // 有规则的字段已由递归处理给出判定
+    private void addFieldSelectionDecisions(Map<String, Object> view,
+                                            com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item,
+                                            AccessRequest request, Policy policy,
+                                            List<FieldDecision> decisions,
+                                            List<FieldSelectionService.FieldHit> hits) {
+        if (item.fields().isEmpty()) {
+            // 全字段访问（仅可能出现在批量访问入口）：保持原约定，顶层无规则字段补一条 ALLOW
+            for (String f : view.keySet()) {
+                if (decisionService.findRule(policy, f) != null) {
+                    continue;
+                }
+                boolean already = decisions.stream().anyMatch(d -> ("$." + f).equals(d.path()));
+                if (!already) {
+                    decisions.add(new FieldDecision("$." + f, f, FieldAction.ALLOW, ReasonCode.ALLOWED,
+                            request.clearance(), Level.PUBLIC, policy.version()));
+                }
             }
-            boolean already = decisions.stream().anyMatch(d -> f.equals(d.field()));
-            if (!already) {
-                decisions.add(new FieldDecision("$." + f, f, FieldAction.ALLOW, ReasonCode.ALLOWED,
-                        request.clearance(), Level.PUBLIC, policy.version()));
+            return;
+        }
+        // 按点名字段：逐处命中核对递归处理是否已产出依据（按路径判重），无规则字段补 ALLOW
+        for (FieldSelectionService.FieldHit hit : hits) {
+            boolean already = decisions.stream().anyMatch(d -> hit.path().equals(d.path()));
+            if (already) {
+                continue; // 有规则字段已由递归处理在该路径给出 ALLOW/MASK/DENY
+            }
+            decisions.add(new FieldDecision(hit.path(), hit.canonicalName(), FieldAction.ALLOW,
+                    ReasonCode.ALLOWED, request.clearance(), Level.PUBLIC, policy.version()));
+        }
+        // 点名却零命中的逻辑字段（任何层级/包装/别名下都不存在）：如实标记 NOT_FOUND
+        java.util.Set<String> hitNames = new java.util.LinkedHashSet<>();
+        for (FieldSelectionService.FieldHit hit : hits) {
+            hitNames.add(hit.canonicalName());
+        }
+        for (String wanted : fieldSelectionService.canonicalNames(policy, item.fields())) {
+            if (!hitNames.contains(wanted)) {
+                decisions.add(decisionService.notFound(policy, request, wanted));
             }
         }
     }
 
-    /** 导出授权范围校验：记录与字段都必须在授权范围内。 */
-    private static void checkGrantScope(
+    private static String describeNotFound(List<FieldDecision> decisions) {
+        List<String> missing = new ArrayList<>();
+        for (FieldDecision d : decisions) {
+            if (d.action() == FieldAction.NOT_FOUND) {
+                missing.add(d.field());
+            }
+        }
+        return "点名字段在记录中不存在或取不到：" + missing;
+    }
+
+    /** 导出授权范围校验：记录与字段（别名归一后）都必须在授权范围内。 */
+    private void checkGrantScope(
             com.github.xingjianluo.dataprivacygatewayjava.model.ExportGrant grant,
-            com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item) {
+            com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item,
+            Policy policy) {
         if (!grant.recordIds().contains(item.recordId())) {
             throw new GatewayException(ReasonCode.GRANT_SCOPE_VIOLATION,
                     "记录 " + item.recordId() + " 不在授权范围");
         }
-        for (String f : item.fields()) {
-            if (!grant.fields().contains(f)) {
+        java.util.Set<String> grantCanonical =
+                fieldSelectionService.canonicalNames(policy, grant.fields());
+        for (String f : fieldSelectionService.canonicalNames(policy, item.fields())) {
+            if (!grantCanonical.contains(f)) {
                 throw new GatewayException(ReasonCode.GRANT_SCOPE_VIOLATION,
                         "字段 " + f + " 不在授权范围");
             }
         }
-    }
-
-    /** 按点名的逻辑字段筛选顶层键：字段本名、规则字段名或别名命中即保留。 */
-    private Map<String, Object> selectFields(Map<String, Object> view, List<String> wanted,
-                                             Policy policy) {
-        Map<String, Object> selected = new LinkedHashMap<>();
-        for (Map.Entry<String, Object> e : view.entrySet()) {
-            String key = e.getKey();
-            if (wanted.contains(key)) {
-                selected.put(key, e.getValue());
-                continue;
-            }
-            FieldRule rule = decisionService.findRule(policy, key);
-            if (rule != null && wanted.contains(rule.field())) {
-                selected.put(key, e.getValue());
-            }
-        }
-        return selected;
     }
 
     private int batchMaxItems() {

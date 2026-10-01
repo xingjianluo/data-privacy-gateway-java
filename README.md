@@ -37,6 +37,8 @@ web/        REST 控制器 + GlobalExceptionHandler（统一受控错误响应�
 - **嵌套 / 数组 / 包装一致处理**：递归遍历时按「逻辑字段名」匹配规则；字段无论出现在
   任意深度、数组下标、别名键，还是 `{"value": x}` / `{"type":"HOME","value":x}` 包装下，
   都得到相同处理，并有独立的 `FieldDecision(path, field, action, reason, caller, required, policyVersion)`。
+  批量入口点名访问时沿用同一口径做深层定位与裁剪（详见第 8 节）；点名却在任何层级都取不到
+  的字段给出 `NOT_FOUND / FIELD_NOT_FOUND`，不用空结果冒充允许。
 - **脱敏幂等**：固定脱敏结果；已是脱敏令牌 `***MASKED***` 或密文信封的值不再变形，
   重复处理不会叠加（不会出现 `********` 或把密文再脱敏）。
 
@@ -96,14 +98,26 @@ REJECT 模式超限直接拒绝；TRUNCATE 模式仅对过深子树与超长数�
 
 ### 批量访问 `batchAccess`
 
-- 一次请求携带多条 `BatchItem{recordId, fields}`；`fields` 为空表示全部字段，
-  点名时只返回命中的顶层逻辑字段（别名归一后命中也算）。
+- 一次请求携带多条 `BatchItem{recordId, fields}`；`fields` 为空表示全部字段。
+  **点名时按「逻辑字段名」做深层定位**，字段无论出现在记录的哪一层都能命中并返回：
+  - 嵌套子对象任意深度的键（如 `profile.mobile`）；
+  - 数组元素：普通对象元素内部的键、`{"value":x}` / `{"type":t,"value":x}`
+    包装元素（继承数组父键逻辑名）；
+  - 标量直接出现、以密文信封出现、以单键/双键包装出现、或以**别名键**
+    （如 `mobile`/`telephone`→`phone`）出现。
+  裁剪只保留命中字段本身以及通向它的**容器链**，未点名的兄弟内容绝不带出。
 - 逐条返回 `BatchItemResult{outcome, view, decisions, policyVersion, keyVersion, auditEventId}`：
-  允许 / 脱敏 / 拒绝 / 失败混在同一批里逐条可区分；**某一条被拒绝或失败不影响其他条目**，
+  允许 / 脱敏 / 拒绝 / 失败 / 字段不存在混在同一批里逐条可区分；**某一条被拒绝或失败不影响其他条目**，
   被拒绝的条目不携带任何字段视图（与单条入口相同的失败安全）。
-- 每条结果都带判定依据：有规则字段由递归处理产出 `FieldDecision`，
-  无规则字段在批量路径显式补一条 `ALLOW(PUBLIC)` 依据；每条都钉在批次开始时的
+- **每个点名字段都带独立判定依据**：命中字段的**每一处出现**都产出一条
+  `FieldDecision(path, field, action, reason, caller, required, policyVersion)`，
+  `path` 精确到嵌套路径 / 数组下标 / 包装位置；有规则字段由递归判定产出
+  ALLOW/MASK/DENY，无规则字段按 PUBLIC 显式补一条 ALLOW；每条都钉在批次开始时的
   `(policyVersion, keyVersion)` 上。
+- **点名字段不存在/取不到时如实体现**：若某逻辑字段在该记录的任何层级、包装、别名下
+  都没有命中，则补一条 `action=NOT_FOUND, reason=FIELD_NOT_FOUND` 依据，条目结论为
+  `FIELD_NOT_FOUND`（同批其余正常条目不受影响）；视图中只含确实取到的点名字段。
+  **绝不允许返回空结果却报 ALLOW**。
 - 密文信封按「该字段的标量值」参与字段级判定（脱敏对信封幂等不变形），
   不会因信封是对象而绕过规则。
 
@@ -115,11 +129,15 @@ REJECT 模式超限直接拒绝；TRUNCATE 模式仅对过深子树与超长数�
 - 校验失败原因码彼此可区分并全部留审计：
   `GRANT_NOT_FOUND`（不存在/已撤销）、`GRANT_EXPIRED`（已过期）、
   `GRANT_CALLER_MISMATCH`（跨调用方使用）、`GRANT_SCOPE_VIOLATION`（记录/字段越范围，
-  越范围按条目拒绝，不拖垮整批）。
-- **授权只收紧不放宽**：导出条目按与单条入口相同的 `raw` 口径做字段级判定，
-  同一字段同一持证等级在两个入口结论一致；授权范围内判定为 ALLOW 的密文信封
-  按信封版本解密（轮换后历史密文仍可解开），明文只存在于返回视图，不落库。
-- 条目未点名字段时，导出范围自动收敛为授权字段范围（空选择 ≠ 全表导出）。
+  越范围按条目拒绝，不拖垮整批；字段范围同样做**别名归一**，用别名点名不能绕过）。
+- **两入口口径完全一致**：导出沿用与普通批量访问**相同的调用方持证等级与相同 `raw`
+  语义**做字段级判定。对同一份数据、同一批点名字段：高权限两处都 ALLOW、低权限普通读取
+  两处都逐字段 MASK、`raw=true` 越权两处都整单 DENY、字段不存在两处都 FIELD_NOT_FOUND；
+  返回的结构范围与逐字段判定依据（路径/动作/原因/所需持证等级/策略版本）逐项相同。
+- **授权只收紧不放宽**：仅对判定为 ALLOW 的密文信封按信封版本解密（轮换后历史密文仍可
+  解开）；低权限下被 MASK 的字段信封原样保留、**不会被解密**。明文只存在于返回视图，不落库。
+- 点名字段的深层/数组/包装/别名匹配范围与普通批量访问完全相同；
+  条目未点名字段时，导出范围自动收敛为授权字段范围（空选择 ≠ 全表导出）。
 
 ### 批量规模 / 耗时 / 并发
 
@@ -136,7 +154,8 @@ REJECT 模式超限直接拒绝；TRUNCATE 模式仅对过深子树与超长数�
 
 单条入口（`access` / `decryptRecord` / `encryptFields`）行为完全不变；批量路径复用同一套
 `DecisionService` / `MaskingService` / `CryptoService` 与同一递归处理器，仅新增：
-批量编排、授权校验、无规则字段的显式 ALLOW 依据（仅批量路径）。
+批量编排、授权校验、点名字段的深层定位与裁剪（`FieldSelectionService`）、
+无规则字段的显式 ALLOW 依据与点名字段缺失的 NOT_FOUND 依据（仅批量路径）。
 
 ## 9. REST 速览
 
@@ -158,7 +177,8 @@ POST /api/gateway/batch/export?grantId=   批量明文导出（需有效授权�
 ## 10. 验证方法
 
 ```bash
-mvn -o test                 # 离线全量测试（42 个用例）
+mvn -o test                 # 离线全量测试（52 个用例）
+mvn -o test -Dtest=NamedFieldSelectionTest # 只跑点名字段深层匹配
 mvn -o test -Dtest=KeyRotationTest       # 只跑密钥轮换
 mvn -o test -Dtest=ConcurrencyUpdateTest # 只跑并发更新
 mvn spring-boot:run         # 启动服务（播种密钥 v1、策略 v1）
@@ -177,8 +197,13 @@ mvn spring-boot:run         # 启动服务（播种密钥 v1、策略 v1）
 - `LimitGuardTest`：REJECT/TRUNCATE、深度/数组/耗时超限、拒绝无半成品
 - `BatchAccessTest`：批量中允许/脱敏/拒绝混合、点名字段、单批条数超限（拒绝/截断）、
   超时整批失败无部分结果
-- `ExportGrantTest`：限时授权签发/越范围/过期/跨调用方/撤销、字段级口径与单条入口一致、
-  密钥轮换后批量解密历史密文、并发撤销下每批完整成功或干净拒绝
+- `NamedFieldSelectionTest`：点名字段位于嵌套子对象、数组元素（对象键 / 包装元素）、
+  单键与双键包装、别名键下时，批量访问与批量导出都能拿到字段与逐处判定依据（高权限
+  ALLOW / 低权限 MASK / raw DENY）；点名字段不存在返回 `FIELD_NOT_FOUND` 且不冒充允许；
+  点名授权范围外字段（含用别名绕过）按条目拒绝；某条失败不拖累同批；两入口同口径一致；
+  导出只解密 ALLOW 信封、脱敏信封保留、明文不落库
+- `ExportGrantTest`：限时授权签发/越范围/过期/跨调用方/撤销、字段级口径与普通批量访问
+  一致（同 raw 语义）、密钥轮换后批量解密历史密文、并发撤销下每批完整成功或干净拒绝
 
 ### curl 示例
 

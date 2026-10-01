@@ -1,5 +1,6 @@
 package com.github.xingjianluo.dataprivacygatewayjava.tests;
 
+import com.github.xingjianluo.dataprivacygatewayjava.crypto.AesGcmCryptoService;
 import com.github.xingjianluo.dataprivacygatewayjava.error.GatewayException;
 import com.github.xingjianluo.dataprivacygatewayjava.model.AccessRequest;
 import com.github.xingjianluo.dataprivacygatewayjava.model.BatchAccessRequest;
@@ -152,15 +153,33 @@ class ExportGrantTest {
         GatewayException single = assertThrows(GatewayException.class, () ->
                 gateway.access(new AccessRequest("ops", Level.PUBLIC, "ex-1", true)));
         assertEquals(ReasonCode.DENIED_UNAUTHORIZED_RAW_READ, single.code());
-        // 批量导出入口：同样持证等级，即使握有授权也必须得到同样的字段级拒绝
-        BatchResponse resp = gateway.batchExport(grant.grantId(),
+        // 批量导出入口：显式 raw=true + 低持证等级，同样必须得到字段级拒绝
+        BatchResponse rawResp = gateway.batchExport(grant.grantId(),
+                new BatchAccessRequest("ops", Level.PUBLIC, true,
+                        List.of(new BatchItem("ex-1", List.of("phone")))));
+        LOG.info("[GRANT-CASE=consistentRaw] single={} batchItem={}",
+                single.code(), rawResp.results().get(0).outcome());
+        assertEquals(ReasonCode.DENIED_UNAUTHORIZED_RAW_READ, rawResp.results().get(0).outcome(),
+                "授权只收紧不放宽：raw=true 时两个入口都必须字段级拒绝");
+        assertNull(rawResp.results().get(0).view());
+        // 普通读取（raw=false）+ 低持证等级：两个入口都必须逐字段脱敏（口径一致），
+        // 授权不会把权限放宽成可取明文
+        BatchResponse maskResp = gateway.batchExport(grant.grantId(),
                 new BatchAccessRequest("ops", Level.PUBLIC, false,
                         List.of(new BatchItem("ex-1", List.of("phone")))));
-        LOG.info("[GRANT-CASE=consistent] single={} batchItem={}",
-                single.code(), resp.results().get(0).outcome());
-        assertEquals(ReasonCode.DENIED_UNAUTHORIZED_RAW_READ, resp.results().get(0).outcome(),
-                "授权只收紧不放宽：同一字段同一持证等级，两个入口口径必须一致");
-        assertNull(resp.results().get(0).view());
+        BatchResponse accessMask = gateway.batchAccess(
+                new BatchAccessRequest("ops", Level.PUBLIC, false,
+                        List.of(new BatchItem("ex-1", List.of("phone")))));
+        LOG.info("[GRANT-CASE=consistentMask] export={} access={}",
+                maskResp.results().get(0).outcome(), accessMask.results().get(0).outcome());
+        assertEquals(ReasonCode.MASKED_INSUFFICIENT_CLEARANCE,
+                maskResp.results().get(0).outcome());
+        assertEquals(accessMask.results().get(0).outcome(), maskResp.results().get(0).outcome(),
+                "同一字段同一持证等级，普通批量访问与批量导出结论必须一致");
+        // 已加密的 phone 信封在低权限下不被解开
+        Object exportedPhone = maskResp.results().get(0).view().get("phone");
+        assertTrue(AesGcmCryptoService.isEnvelope(exportedPhone),
+                "授权不放宽：低权限导出不得解开密文信封");
     }
 
     @Test
