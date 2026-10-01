@@ -282,15 +282,17 @@ public class PrivacyGateway {
         String eventId;
         {
             java.util.Map<String, String> detail = new java.util.LinkedHashMap<>();
-            int allow = 0, mask = 0, deny = 0;
+            int allow = 0, mask = 0, deny = 0, notFound = 0;
             for (FieldDecision dd : decisions) {
                 switch (dd.action()) {
                     case ALLOW -> allow++;
                     case MASK -> mask++;
                     case DENY -> deny++;
+                    case NOT_FOUND -> notFound++;
                 }
             }
-            detail.put("counts", "ALLOW=" + allow + ",MASK=" + mask + ",DENY=" + deny);
+            detail.put("counts", "ALLOW=" + allow + ",MASK=" + mask + ",DENY=" + deny
+                    + ",NOT_FOUND=" + notFound);
             detail.put("rawRequested", String.valueOf(request.rawRequested()));
             eventId = auditService.record(request.caller(), "ACCESS", request.recordId(),
                     overall, policy.version(), pinnedKeyVersion, inputDigest,
@@ -418,18 +420,23 @@ public class PrivacyGateway {
             }
             @SuppressWarnings("unchecked")
             Map<String, Object> view = (Map<String, Object>) JsonCodec.deepCopy(record.data());
-            // 条目点名了字段：只保留命中的顶层逻辑字段（含别名归一）
+            List<FieldSite> sites = new ArrayList<>();
+            // 条目点名了字段：按逻辑名（本名/别名）在任意深度、数组元素、value/type-value 包装下
+            // 做深度投影，只保留命中路径，同时记录每个命中点以便逐项给出判定依据
             if (!item.fields().isEmpty()) {
-                view = selectFields(view, item.fields(), policy);
+                Projection projection = projectFields(view, item.fields(), policy);
+                view = projection.view();
+                sites = projection.sites();
             }
             AccessRequest single = new AccessRequest(request.caller(), request.clearance(),
                     recordId, request.rawRequested());
             List<FieldDecision> decisions = new ArrayList<>();
             boolean[] truncated = {false};
             process(view, "$", 1, null, single, policy, decisions, truncated, startNanos);
-            addImplicitAllowDecisions(view, item, request, policy, decisions);
+            addBatchFieldDecisions(view, item, request, policy, decisions, sites);
 
             boolean denied = decisions.stream().anyMatch(d -> d.action() == FieldAction.DENY);
+            boolean notFound = decisions.stream().anyMatch(d -> d.action() == FieldAction.NOT_FOUND);
             ReasonCode outcome;
             if (denied) {
                 outcome = ReasonCode.DENIED_UNAUTHORIZED_RAW_READ;
@@ -437,13 +444,17 @@ public class PrivacyGateway {
                 outcome = ReasonCode.TRUNCATED_BY_LIMIT;
             } else if (decisions.stream().anyMatch(d -> d.action() == FieldAction.MASK)) {
                 outcome = ReasonCode.MASKED_INSUFFICIENT_CLEARANCE;
+            } else if (notFound) {
+                // 点名字段确实不存在/取不到：如实体现，不允许“空结果却报 ALLOW”
+                outcome = ReasonCode.REJECT_MISSING_FIELD;
             } else {
                 outcome = ReasonCode.ALLOWED;
             }
             String eventId = auditService.record(request.caller(), operation, recordId, outcome,
                     policy.version(), pinnedKeyVersion, safeDigest(record.data()),
                     summarize(decisions), Map.of("batchItem", "true"));
-            // 与单条入口一致的失败安全：越权取原文的条目不返回任何字段视图
+            // 与单条入口一致的失败安全：越权取原文的条目不返回任何字段视图；
+            // 其余情况（含部分字段不存在）视图照常返回，缺失由 NOT_FOUND 判定逐项体现
             Map<String, Object> resultView = denied ? null : view;
             if (resultView != null && decrypt) {
                 // 明文导出：解开视图中的密文信封（按信封版本取历史密钥，轮换后仍可解）。
@@ -468,26 +479,276 @@ public class PrivacyGateway {
     }
 
     /**
-     * 批量路径补充：无规则字段按 PUBLIC 显式补一条 ALLOW 判定依据，
-     * 让每条结果都能给出完整依据（单条入口行为保持不变）。
+     * 批量条目的字段判定补齐：
+     * <ul>
+     *   <li>点名字段：无规则命中点补一条 PUBLIC/ALLOW 依据；任何位置都取不到的点名逻辑字段
+     *       补一条 NOT_FOUND 依据（绝不允许“空结果却报允许”）；</li>
+     *   <li>未点名字段（全字段访问）：保持原约定，顶层无规则键补一条 ALLOW 依据。</li>
+     * </ul>
+     * sites 为深度投影时记录的“标量值位点”，其路径与递归 process 的路径口径一致
+     * （均以投影后视图为准，数组下标因此不会错位）。
      */
-    private void addImplicitAllowDecisions(Map<String, Object> view,
-                                           com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item,
-                                           BatchAccessRequest request, Policy policy,
-                                           List<FieldDecision> decisions) {
-        List<String> candidates = item.fields().isEmpty()
-                ? List.copyOf(view.keySet())
-                : item.fields();
-        for (String f : candidates) {
-            if (decisionService.findRule(policy, f) != null) {
-                continue; // 有规则的字段已由递归处理给出判定
+    private void addBatchFieldDecisions(Map<String, Object> view,
+                                        com.github.xingjianluo.dataprivacygatewayjava.model.BatchItem item,
+                                        BatchAccessRequest request, Policy policy,
+                                        List<FieldDecision> decisions, List<FieldSite> sites) {
+        if (item.fields().isEmpty()) {
+            for (String f : List.copyOf(view.keySet())) {
+                if (decisionService.findRule(policy, f) != null) {
+                    continue;
+                }
+                final String path = "$." + f;
+                if (decisions.stream().noneMatch(d -> path.equals(d.path()))) {
+                    decisions.add(new FieldDecision(path, f, FieldAction.ALLOW, ReasonCode.ALLOWED,
+                            request.clearance(), Level.PUBLIC, policy.version()));
+                }
             }
-            boolean already = decisions.stream().anyMatch(d -> f.equals(d.field()));
-            if (!already) {
-                decisions.add(new FieldDecision("$." + f, f, FieldAction.ALLOW, ReasonCode.ALLOWED,
-                        request.clearance(), Level.PUBLIC, policy.version()));
+            return;
+        }
+        // 1) 投影命中的无规则位点补 ALLOW（有规则位点已由递归 process 给出判定）
+        for (FieldSite site : sites) {
+            if (decisionService.findRule(policy, site.logical()) != null) {
+                continue;
+            }
+            if (decisions.stream().noneMatch(d -> site.path().equals(d.path()))) {
+                decisions.add(new FieldDecision(site.path(), site.logical(), FieldAction.ALLOW,
+                        ReasonCode.ALLOWED, request.clearance(), Level.PUBLIC, policy.version()));
             }
         }
+        // 2) 任何位置都没出现的点名字段：逐项 NOT_FOUND（按逻辑本名去重，别名归一）
+        java.util.Set<String> missing = new java.util.LinkedHashSet<>();
+        for (String wanted : item.fields()) {
+            FieldRule rule = decisionService.findRule(policy, wanted);
+            String canonical = rule == null ? wanted : rule.field();
+            boolean hit = sites.stream().anyMatch(s -> {
+                FieldRule sr = decisionService.findRule(policy, s.logical());
+                return canonical.equals(sr == null ? s.logical() : sr.field());
+            });
+            if (!hit) {
+                missing.add(canonical);
+            }
+        }
+        for (String f : missing) {
+            FieldRule rule = decisionService.findRule(policy, f);
+            Level required = rule == null ? Level.PUBLIC : rule.requiredLevel();
+            decisions.add(new FieldDecision("$.", f, FieldAction.NOT_FOUND,
+                    ReasonCode.REJECT_MISSING_FIELD, request.clearance(), required,
+                    policy.version()));
+        }
+    }
+
+    /** 深度投影：把点名逻辑字段从任意深度/数组/包装/别名位置“提取”出来，保留必要容器层级。 */
+    private Projection projectFields(Map<String, Object> root, List<String> wanted, Policy policy) {
+        List<FieldSite> sites = new ArrayList<>();
+        Object projected = projectMap(root, "$", null, wanted, policy, sites);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> view = projected == ABSENT
+                ? new LinkedHashMap<>()
+                : (Map<String, Object>) projected;
+        return new Projection(view, List.copyOf(sites));
+    }
+
+    /**
+     * 投影一个对象，返回投影后的对象；该对象整体无任何命中时返回 {@link #ABSENT}。
+     * 命中包装且内层是容器时，容器子树整体保留（见 {@link #keepAll}）。
+     */
+    private Object projectMap(Map<?, ?> rawMap, String path, String wrapperField,
+                              List<String> wanted, Policy policy, List<FieldSite> sites) {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> map = (Map<String, Object>) rawMap;
+        if (isWrapperMap(map)) {
+            String logical = wrapperField != null ? wrapperField : "value";
+            boolean match = isWanted(wanted, logical, policy);
+            Object inner = map.get("value");
+            if (match) {
+                if (inner instanceof Map<?, ?> || inner instanceof List<?>) {
+                    // 命中包装但内层是容器：包装骨架保留，容器内子树整体保留
+                    sites.add(new FieldSite(path, logical));
+                    Object child = keepAll(inner, path + ".value", "value",
+                            wanted, policy, sites);
+                    return rebuildWrapper(map, child);
+                }
+                // 命中包装且内层为标量/信封：这是该逻辑字段的取值位点
+                sites.add(new FieldSite(path, logical));
+                return map;
+            }
+            if (inner instanceof Map<?, ?> im) {
+                Object child = projectMap(im, path + ".value", "value", wanted, policy, sites);
+                return child == ABSENT ? ABSENT : rebuildWrapper(map, child);
+            }
+            if (inner instanceof List<?> il) {
+                ProjectedList pl = projectList(il, path + ".value", "value",
+                        wanted, policy, sites);
+                return pl == null ? ABSENT : rebuildWrapper(map, pl.list());
+            }
+            return ABSENT;
+        }
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : map.entrySet()) {
+            String key = e.getKey();
+            Object child = e.getValue();
+            String childPath = path + "." + key;
+            if (AesGcmCryptoService.isEnvelope(child)) {
+                if (isWanted(wanted, key, policy)) {
+                    sites.add(new FieldSite(childPath, key));
+                    out.put(key, child);
+                }
+                continue;
+            }
+            if (child instanceof Map<?, ?> cm) {
+                Object pr = projectMap(cm, childPath, key, wanted, policy, sites);
+                if (pr != ABSENT) {
+                    out.put(key, pr);
+                }
+                continue;
+            }
+            if (child instanceof List<?> cl) {
+                ProjectedList pl = projectList(cl, childPath, key, wanted, policy, sites);
+                if (pl != null) {
+                    out.put(key, pl.list());
+                }
+                continue;
+            }
+            if (isWanted(wanted, key, policy)) {
+                sites.add(new FieldSite(childPath, key));
+                out.put(key, child);
+            }
+        }
+        return out.isEmpty() ? ABSENT : out;
+    }
+
+    /**
+     * 投影一个数组：命中的是数组整体（调用方已确认数组字段被点名）时整组保留，
+     * 否则逐元素投影；投影后为空的元素被丢弃（只留下含命中内容的元素，
+     * 返回视图与判定路径下标天然对齐）。返回 null 表示整个数组无命中。
+     */
+    private ProjectedList projectList(List<?> list, String basePath, String wrapperField,
+                                      List<String> wanted, Policy policy, List<FieldSite> sites) {
+        List<Object> kept = new ArrayList<>();
+        for (Object child : list) {
+            String elementPath = basePath + "[" + kept.size() + "]";
+            // 与递归 process 相同的继承规则：普通对象元素不继承包装父键名
+            String childWrapper = (child instanceof Map<?, ?> cm && !isWrapperMap(cm))
+                    ? null : wrapperField;
+            if (AesGcmCryptoService.isEnvelope(child)) {
+                if (childWrapper != null && isWanted(wanted, childWrapper, policy)) {
+                    sites.add(new FieldSite(elementPath, childWrapper));
+                    kept.add(child);
+                }
+                continue;
+            }
+            if (child instanceof Map<?, ?> cm) {
+                Object pr = projectMap(cm, elementPath, childWrapper, wanted, policy, sites);
+                if (pr != ABSENT) {
+                    kept.add(pr);
+                }
+                continue;
+            }
+            if (child instanceof List<?> cl) {
+                ProjectedList pl = projectList(cl, elementPath, childWrapper,
+                        wanted, policy, sites);
+                if (pl != null) {
+                    kept.add(pl.list());
+                }
+                continue;
+            }
+            if (childWrapper != null && isWanted(wanted, childWrapper, policy)) {
+                sites.add(new FieldSite(elementPath, childWrapper));
+                kept.add(child);
+            }
+        }
+        return kept.isEmpty() ? null : new ProjectedList(kept);
+    }
+
+    /**
+     * 已命中容器的子树整棵保留：只登记值位点（供无规则字段补 ALLOW 依据），
+     * 不做裁剪。返回值即原节点。
+     */
+    private Object keepAll(Object node, String path, String wrapperField,
+                           List<String> wanted, Policy policy, List<FieldSite> sites) {
+        if (node instanceof Map<?, ?> rawMap) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> map = (Map<String, Object>) rawMap;
+            if (isWrapperMap(map)) {
+                String logical = wrapperField != null ? wrapperField : "value";
+                sites.add(new FieldSite(path, logical));
+                Object inner = map.get("value");
+                if (inner instanceof Map<?, ?> || inner instanceof List<?>) {
+                    keepAll(inner, path + ".value", "value", wanted, policy, sites);
+                }
+                return map;
+            }
+            for (Map.Entry<String, Object> e : map.entrySet()) {
+                String childPath = path + "." + e.getKey();
+                Object child = e.getValue();
+                if (AesGcmCryptoService.isEnvelope(child)) {
+                    sites.add(new FieldSite(childPath, e.getKey()));
+                } else if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                    keepAll(child, childPath, e.getKey(), wanted, policy, sites);
+                } else {
+                    sites.add(new FieldSite(childPath, e.getKey()));
+                }
+            }
+            return map;
+        }
+        if (node instanceof List<?> list) {
+            @SuppressWarnings("unchecked")
+            List<Object> arr = (List<Object>) node;
+            for (int i = 0; i < arr.size(); i++) {
+                Object child = arr.get(i);
+                String elementPath = path + "[" + i + "]";
+                String childWrapper = (child instanceof Map<?, ?> cm && !isWrapperMap(cm))
+                        ? null : wrapperField;
+                if (AesGcmCryptoService.isEnvelope(child)) {
+                    if (childWrapper != null) {
+                        sites.add(new FieldSite(elementPath, childWrapper));
+                    }
+                } else if (child instanceof Map<?, ?> || child instanceof List<?>) {
+                    keepAll(child, elementPath, childWrapper, wanted, policy, sites);
+                } else if (childWrapper != null) {
+                    sites.add(new FieldSite(elementPath, childWrapper));
+                }
+            }
+            return arr;
+        }
+        return node;
+    }
+
+    /** 包装命中且内层容器投影后：保留包装的 type（若有），value 替换为投影结果。 */
+    private static Map<String, Object> rebuildWrapper(Map<?, ?> original, Object projectedInner) {
+        Map<String, Object> rebuilt = new LinkedHashMap<>();
+        if (original.containsKey("type")) {
+            rebuilt.put("type", original.get("type"));
+        }
+        rebuilt.put("value", projectedInner);
+        return rebuilt;
+    }
+
+    /** 逻辑名命中点名集合：本名或任一别名归一到同一规则字段后比较。 */
+    private boolean isWanted(List<String> wanted, String logical, Policy policy) {
+        FieldRule rule = decisionService.findRule(policy, logical);
+        String canonical = rule == null ? logical : rule.field();
+        for (String w : wanted) {
+            FieldRule wr = decisionService.findRule(policy, w);
+            if (canonical.equals(wr == null ? w : wr.field())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 投影内部用：对象在投影后无任何命中。 */
+    private static final Object ABSENT = new Object();
+
+    /** 一个投影值位点：路径（以投影后视图为准）+ 解析时使用的逻辑字段名。 */
+    private record FieldSite(String path, String logical) {
+    }
+
+    private record ProjectedList(List<Object> list) {
+    }
+
+    private record Projection(Map<String, Object> view, List<FieldSite> sites) {
     }
 
     /** 导出授权范围校验：记录与字段都必须在授权范围内。 */
@@ -506,24 +767,6 @@ public class PrivacyGateway {
         }
     }
 
-    /** 按点名的逻辑字段筛选顶层键：字段本名、规则字段名或别名命中即保留。 */
-    private Map<String, Object> selectFields(Map<String, Object> view, List<String> wanted,
-                                             Policy policy) {
-        Map<String, Object> selected = new LinkedHashMap<>();
-        for (Map.Entry<String, Object> e : view.entrySet()) {
-            String key = e.getKey();
-            if (wanted.contains(key)) {
-                selected.put(key, e.getValue());
-                continue;
-            }
-            FieldRule rule = decisionService.findRule(policy, key);
-            if (rule != null && wanted.contains(rule.field())) {
-                selected.put(key, e.getValue());
-            }
-        }
-        return selected;
-    }
-
     private int batchMaxItems() {
         return batchProperties().getMaxItems();
     }
@@ -531,9 +774,6 @@ public class PrivacyGateway {
     private com.github.xingjianluo.dataprivacygatewayjava.config.GatewayProperties.Batch batchProperties() {
         return batchProps.getBatch();
     }
-
-    /**
-     * 递归处理 JSON 结构。
 
     /** 签发限时明文导出授权。 */
     public com.github.xingjianluo.dataprivacygatewayjava.model.ExportGrant issueGrant(
